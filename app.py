@@ -19,6 +19,25 @@ Optional:
 Alerts are delivered via Telegram only. Configure TELEGRAM_BOT_TOKEN and
 TELEGRAM_CHAT_ID to receive them; without them, breakout signals still show
 in the dashboard table but nothing is pushed anywhere.
+
+Buy vs. sell volume note:
+    Upstox's public historical-candle API returns OHLCV only — it does not
+    tag individual trades as buyer- or seller-initiated, so there is no way
+    to get a literal "number of buyers vs. number of sellers" from it. What
+    this script computes instead is a standard proxy used by most retail
+    scanners: the Close Location Value (CLV) method, also used inside
+    Chaikin Money Flow. Volume for the candle is split according to where
+    the close sits within the candle's high-low range:
+
+        buy_fraction  = (close - low) / (high - low)
+        buy_volume    = candle_volume * buy_fraction
+        sell_volume   = candle_volume * (1 - buy_fraction)
+        volume_delta  = buy_volume - sell_volume
+
+    A close near the high implies most of the candle's volume was
+    aggressive buying; a close near the low implies the opposite. This is
+    an approximation, not tape/order-flow data — treat it as directional
+    confirmation, not an exact trade count.
 """
 
 from __future__ import annotations
@@ -337,6 +356,25 @@ def prune_old_alerts(state: dict[str, Any], keep_days: int = ALERT_RETENTION_DAY
     state["alerts"] = kept
 
 
+def buy_sell_volume_split(row: pd.Series) -> tuple[float, float, float]:
+    """Approximate buy volume vs. sell volume for a single OHLCV candle
+    using the Close Location Value (CLV) method (same idea as Chaikin
+    Money Flow): the closer the close sits to the candle high, the more of
+    the candle's volume is attributed to buyers, and vice versa.
+
+    Returns (buy_volume, sell_volume, delta) where delta = buy - sell.
+    This is a proxy for order flow, not actual buyer/seller trade counts -
+    Upstox's historical-candle API doesn't expose that.
+    """
+    high, low, close, volume = float(row.high), float(row.low), float(row.close), float(row.volume)
+    rng = high - low
+    buy_fraction = (close - low) / rng if rng > 0 else 0.5
+    buy_fraction = min(1.0, max(0.0, buy_fraction))
+    buy_volume = volume * buy_fraction
+    sell_volume = volume - buy_volume
+    return buy_volume, sell_volume, buy_volume - sell_volume
+
+
 def send_telegram(text: str) -> bool | None:
     """True if delivered, False if an attempt was made and failed, or None
     if Telegram isn't configured at all."""
@@ -356,7 +394,8 @@ def send_telegram(text: str) -> bool | None:
 
 
 def send_alert(symbol: str, direction: str, level: dict[str, Any], row: pd.Series,
-               avg_volume: float, ratio: float, signal_time: datetime) -> bool | None:
+               avg_volume: float, ratio: float, signal_time: datetime,
+               buy_volume: float, sell_volume: float, delta: float) -> bool | None:
     candle_start = row.timestamp
     candle_end = candle_start + timedelta(minutes=10)
     text = (
@@ -368,7 +407,11 @@ def send_alert(symbol: str, direction: str, level: dict[str, Any], row: pd.Serie
         f"Candle: {candle_start:%H:%M}–{candle_end:%H:%M}\n"
         f"Volume: {row.volume:,.0f}\n"
         f"Average Volume: {avg_volume:,.0f}\n"
-        f"Reason: {'PDH' if direction == 'BUY' else 'PDL'} breakout + high volume"
+        f"Est. Buy Volume: {buy_volume:,.0f}\n"
+        f"Est. Sell Volume: {sell_volume:,.0f}\n"
+        f"Volume Delta (Buy-Sell): {delta:+,.0f}\n"
+        f"Reason: {'PDH' if direction == 'BUY' else 'PDL'} breakout + high volume "
+        f"+ {'buyer' if direction == 'BUY' else 'seller'}-dominant volume delta"
     )
     return send_telegram(text)
 
@@ -385,15 +428,10 @@ def evaluate_stock(token: str, ins: Instrument, level: dict[str, Any],
         df["end"] = df["timestamp"] + timedelta(minutes=10)
         completed = df[df["end"] <= scheduled_time].copy()
         if completed.empty:
-            return {
-                "Symbol": ins.symbol, "LTP": float(df.iloc[-1].close),
-                "PDH": level["pdh"], "PDL": level["pdl"],
-                "Current 10m Candle": "No completed 10m candle",
-                "Direction": "WAIT", "Breakout": None,
-                "Volume": None, "Average Volume": None, "Volume Ratio": None,
-                "Candle Time": None, "Signal Time": scheduled_time,
-                "Alert Status": "No confirmation candle"
-            }
+            # No confirmation candle yet - nothing actionable to show for
+            # this symbol at this scan. Skipped by the caller rather than
+            # surfaced as a row, so the dashboard only lists real signals.
+            return None
 
         row = completed.iloc[-1]
         prior = completed.iloc[:-1]
@@ -402,13 +440,22 @@ def evaluate_stock(token: str, ins: Instrument, level: dict[str, Any],
         avg_volume = float(prior.tail(VOLUME_LOOKBACK)["volume"].mean()) if not prior.empty else math.nan
         ratio = float(row.volume / avg_volume) if avg_volume and not math.isnan(avg_volume) else math.nan
 
+        buy_volume, sell_volume, delta = buy_sell_volume_split(row)
+        delta_pct = (delta / row.volume * 100.0) if row.volume else 0.0
+
         # row.close > pdh already implies row.high >= pdh (high is always >=
         # close), so the breakout test only needs the close + volume checks.
-        buy = row.close > level["pdh"] and ratio >= VOLUME_MULTIPLIER
-        sell = row.close < level["pdl"] and ratio >= VOLUME_MULTIPLIER
+        # Volume delta must agree with direction (net buyers for a PDH
+        # breakout, net sellers for a PDL breakdown) as an extra confirmation
+        # on top of the raw volume-ratio spike.
+        buy = row.close > level["pdh"] and ratio >= VOLUME_MULTIPLIER and delta > 0
+        sell = row.close < level["pdl"] and ratio >= VOLUME_MULTIPLIER and delta < 0
 
-        direction = "BUY" if buy else "SELL" if sell else "WAIT"
-        breakout = float(row.close) if direction != "WAIT" else None
+        direction = "BUY" if buy else "SELL" if sell else None
+        if direction is None:
+            # Breakout/volume/delta conditions not all met - not a signal,
+            # so skip it rather than returning a placeholder "WAIT" row.
+            return None
 
         return {
             "Symbol": ins.symbol,
@@ -417,13 +464,17 @@ def evaluate_stock(token: str, ins: Instrument, level: dict[str, Any],
             "PDL": float(level["pdl"]),
             "Current 10m Candle": f"{row.open:.2f} / {row.high:.2f} / {row.low:.2f} / {row.close:.2f}",
             "Direction": direction,
-            "Breakout": breakout,
+            "Breakout": float(row.close),
             "Volume": float(row.volume),
             "Average Volume": avg_volume if not math.isnan(avg_volume) else None,
             "Volume Ratio": ratio if not math.isnan(ratio) else None,
+            "Buy Volume": buy_volume,
+            "Sell Volume": sell_volume,
+            "Volume Delta": delta,
+            "Delta %": delta_pct,
             "Candle Time": f"{row.timestamp:%H:%M}–{row.end:%H:%M}",
             "Signal Time": scheduled_time.strftime("%H:%M IST"),
-            "Alert Status": "VALID" if direction != "WAIT" else "WAIT",
+            "Alert Status": "VALID",
             "_row": row.to_dict(),
         }
     except RuntimeError:
@@ -434,7 +485,10 @@ def evaluate_stock(token: str, ins: Instrument, level: dict[str, Any],
 
 def scan_all(token: str, instruments: list[Instrument], levels: dict[str, Any],
              scheduled_time: datetime) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    results = []
+    """Returns (signals, signals) - kept as a pair for backward
+    compatibility with callers that expect (results, signals); since
+    evaluate_stock now only returns actionable rows, the two are the same
+    list of BUY/SELL candidates."""
     signals = []
 
     def worker(ins: Instrument):
@@ -449,18 +503,15 @@ def scan_all(token: str, instruments: list[Instrument], levels: dict[str, Any],
             try:
                 x = f.result()
                 if x:
-                    results.append(x)
-                    if x["Direction"] in ("BUY", "SELL"):
-                        signals.append(x)
+                    signals.append(x)
             except RuntimeError as e:
                 if str(e) == "UPSTOX_TOKEN_EXPIRED":
                     raise
             except Exception:
                 pass
 
-    results.sort(key=lambda x: x["Symbol"])
     signals.sort(key=lambda x: (x["Direction"], x["Symbol"]))
-    return results, signals
+    return signals, signals
 
 
 def process_alerts(signals: list[dict[str, Any]], levels: dict[str, Any],
@@ -478,7 +529,13 @@ def process_alerts(signals: list[dict[str, Any]], levels: dict[str, Any],
             row = pd.Series(x["_row"])
             avg = float(x["Average Volume"] or 0)
             ratio = float(x["Volume Ratio"] or 0)
-            delivered = send_alert(x["Symbol"], x["Direction"], lv, row, avg, ratio, scheduled_time)
+            buy_vol = float(x["Buy Volume"] or 0)
+            sell_vol = float(x["Sell Volume"] or 0)
+            delta = float(x["Volume Delta"] or 0)
+            delivered = send_alert(
+                x["Symbol"], x["Direction"], lv, row, avg, ratio, scheduled_time,
+                buy_vol, sell_vol, delta,
+            )
 
             if delivered is None:
                 x["Alert Status"] = "NOT SENT (Telegram not configured)"
@@ -504,21 +561,34 @@ def process_alerts(signals: list[dict[str, Any]], levels: dict[str, Any],
     return sent
 
 
-def render_dashboard(results: list[dict[str, Any]], scan_time: datetime) -> None:
+def render_dashboard(results: list[dict[str, Any]], scan_time: datetime, scanned_count: int) -> None:
     if not results:
-        st.info("No stock data returned for this scan.")
+        st.info(f"No breakout signals this scan (scanned {scanned_count} stocks with prepared levels).")
         return
     df = pd.DataFrame(results)
     if "_row" in df.columns:
         df = df.drop(columns=["_row"])
     cols = [
         "Symbol", "LTP", "PDH", "PDL", "Current 10m Candle",
-        "Direction", "Breakout", "Volume", "Average Volume",
-        "Volume Ratio", "Candle Time", "Signal Time", "Alert Status"
+        "Direction", "Breakout", "Volume", "Average Volume", "Volume Ratio",
+        "Buy Volume", "Sell Volume", "Volume Delta", "Delta %",
+        "Candle Time", "Signal Time", "Alert Status"
     ]
     cols = [c for c in cols if c in df.columns]
-    st.dataframe(df[cols], use_container_width=True, hide_index=True)
-    st.caption(f"Last scheduled scan: {scan_time:%Y-%m-%d %H:%M:%S %Z}")
+    st.dataframe(
+        df[cols].style.format({
+            "LTP": "{:.2f}", "PDH": "{:.2f}", "PDL": "{:.2f}", "Breakout": "{:.2f}",
+            "Volume": "{:,.0f}", "Average Volume": "{:,.0f}", "Volume Ratio": "{:.2f}",
+            "Buy Volume": "{:,.0f}", "Sell Volume": "{:,.0f}", "Volume Delta": "{:+,.0f}",
+            "Delta %": "{:+.1f}",
+        }, na_rep="—"),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(
+        f"Last scheduled scan: {scan_time:%Y-%m-%d %H:%M:%S %Z} — "
+        f"{scanned_count} stocks scanned, {len(results)} breakout signal(s) shown. "
+        f"Buy/Sell Volume is an estimate (Close-Location-Value method), not tape data."
+    )
 
 
 def main():
@@ -536,9 +606,14 @@ def main():
         "Max NSE stocks (0 = full NSE_EQ universe)",
         min_value=0, max_value=5000, value=MAX_STOCKS, step=100
     )
-    st.sidebar.write(f"Volume rule: ≥ {VOLUME_MULTIPLIER:.1f}× average")
+    st.sidebar.write(f"Volume rule: ≥ {VOLUME_MULTIPLIER:.1f}× average, delta-confirmed")
     st.sidebar.write("Schedule: 09:15, 09:25, …, 15:25 IST")
     st.sidebar.write("Alerts: Telegram only")
+    st.sidebar.caption(
+        "Buy/Sell Volume is estimated from each candle's close position "
+        "(Close-Location-Value method) — Upstox candles don't include "
+        "actual buyer/seller trade tags."
+    )
 
     if not token:
         st.warning("Enter the Upstox access token in the sidebar.")
@@ -548,6 +623,8 @@ def main():
         st.session_state.results = []
     if "scan_time" not in st.session_state:
         st.session_state.scan_time = None
+    if "scanned_count" not in st.session_state:
+        st.session_state.scanned_count = 0
     if "status" not in st.session_state:
         st.session_state.status = "Ready"
 
@@ -601,20 +678,21 @@ def main():
             ins = load_instruments(int(max_stocks))
             if not levels:
                 levels, _ = build_levels_parallel(token, ins, today)
-            results, signals = scan_all(token, ins, levels, target)
+            signals, _ = scan_all(token, ins, levels, target)
             state = load_state()
             sent = process_alerts(signals, levels, target, state)
-            st.session_state.results = results
+            st.session_state.results = signals
             st.session_state.scan_time = target
-            st.session_state.status = f"Scan complete — {len(signals)} candidates, {sent} alerts delivered"
+            st.session_state.scanned_count = len(levels)
+            st.session_state.status = f"Scan complete — {len(signals)} signal(s), {sent} alert(s) delivered"
         except RuntimeError as e:
             st.session_state.status = str(e)
             st.error(str(e))
         except Exception as e:
             st.error(f"Scan failed: {e}")
 
-    if st.session_state.results:
-        render_dashboard(st.session_state.results, st.session_state.scan_time)
+    if st.session_state.scan_time:
+        render_dashboard(st.session_state.results, st.session_state.scan_time, st.session_state.scanned_count)
 
     st.divider()
     st.subheader("Automatic scheduler")
@@ -645,13 +723,14 @@ def main():
                 if not current_levels:
                     current_levels, _ = build_levels_parallel(token, ins, now.date())
 
-                results, signals = scan_all(token, ins, current_levels, target)
+                signals, _ = scan_all(token, ins, current_levels, target)
                 state = load_state()
                 sent = process_alerts(signals, current_levels, target, state)
-                st.session_state.results = results
+                st.session_state.results = signals
                 st.session_state.scan_time = target
+                st.session_state.scanned_count = len(current_levels)
                 st.session_state.auto_last_target = target.isoformat()
-                st.session_state.status = f"Auto scan: {target:%H:%M} — {len(signals)} candidates, {sent} delivered"
+                st.session_state.status = f"Auto scan: {target:%H:%M} — {len(signals)} signal(s), {sent} delivered"
             except RuntimeError as e:
                 st.session_state.status = str(e)
                 st.error(str(e))
