@@ -1,898 +1,712 @@
 """
-NSE EMA 6/30 Crossover Scanner
-================================
-A semi-algo Streamlit dashboard that scans all NSE equity stocks for
-EMA 6 / EMA 30 crossover signals using the Upstox REST API (v2 + v3).
+SMC Intraday Signal Assistant — Upstox Edition
+================================================
+A single-file Streamlit app that:
+  - Lets you type in an NSE stock name/symbol
+  - Pulls live + historical intraday candles from the Upstox API
+  - Runs a rule-based Smart Money Concepts (SMC) engine on CLOSED candles only
+    (Break of Structure, Change of Character, Liquidity Sweeps, Order Blocks,
+    Fair Value Gaps, Displacement)
+  - Shows a clear BUY / SELL / WAIT signal with Entry, Stop Loss and Target
+  - Tracks an active "paper" setup and tells you when to EXIT (SL/Target hit)
+  - NEVER places any order. This is a decision-support tool only.
 
-Usage
------
-    streamlit run app.py
+--------------------------------------------------------------------------
+HOW TO RUN
+--------------------------------------------------------------------------
+1) pip install streamlit pandas numpy requests plotly pytz streamlit-autorefresh
+2) streamlit run smc_upstox_app.py
+3) In the sidebar, paste a valid Upstox API v2 access token
+   (generate it via Upstox's OAuth login flow — this app does not do the
+   OAuth dance for you, since that requires a redirect/callback server).
+4) Type a stock name (e.g. "RELIANCE", "TCS", "HDFC BANK"), pick it from the
+   matches, choose a timeframe, and click "Start Monitoring".
 
-• Detects BUY  (EMA 6 crosses above EMA 30)
-• Detects SELL (EMA 6 crosses below EMA 30)
-• Supports 5-minute and 10-minute candle timeframes
-• Uses only fully completed candles — never in-progress ones
-• Ranks signals by most recent crossover first
-• Scans during NSE market hours (09:15 – 15:30 IST)
-• Analysis and alerts only — NO trades are placed
+--------------------------------------------------------------------------
+IMPORTANT NOTES / LIMITATIONS (read before using with real money)
+--------------------------------------------------------------------------
+- This is EDUCATIONAL / DECISION-SUPPORT software. It does not place, modify
+  or cancel any order. Every trade decision and execution is yours.
+- SMC concepts (BOS, CHoCH, OB, FVG, liquidity sweeps, displacement) are
+  discretionary in nature. This engine encodes one reasonable, rule-based
+  interpretation of them — not "the" definitive definition. Validate the
+  chart yourself before acting on any signal.
+- The engine only acts on fully CLOSED candles. The most recent, still-forming
+  candle of your chosen timeframe is always dropped before analysis, so
+  nothing here "repaints" using an incomplete bar.
+- Upstox's exact REST endpoint paths/params can change between API versions.
+  This file targets the Upstox API v2 conventions. If your account is on a
+  different API version, adjust `UPSTOX_BASE` and the two fetch functions.
+- Historical intraday 1-minute data availability is limited by Upstox
+  (typically the current + a few recent trading days). We fetch 1-minute
+  data and resample it locally into your chosen timeframe (3/5/15 min) so
+  we aren't dependent on Upstox supporting every timeframe natively.
 """
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  IMPORTS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-import streamlit as st
-import requests
-import pandas as pd
 import time
-import gzip
-import io
-import json
-import threading
-import logging
-from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from datetime import datetime, timedelta, time as dtime
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  CONSTANTS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import pytz
+import requests
+import streamlit as st
 
-IST = timezone(timedelta(hours=5, minutes=30))
+try:
+    from streamlit_autorefresh import st_autorefresh
+    HAS_AUTOREFRESH = True
+except Exception:
+    HAS_AUTOREFRESH = False
 
-MARKET_OPEN_H, MARKET_OPEN_M = 9, 15
-MARKET_CLOSE_H, MARKET_CLOSE_M = 15, 30
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+IST = pytz.timezone("Asia/Kolkata")
+MARKET_OPEN = dtime(9, 15)
+MARKET_CLOSE = dtime(15, 30)
+UPSTOX_BASE = "https://api.upstox.com/v2"
+INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz"
 
-# Upstox instrument master (JSON, gzipped)
-INSTRUMENTS_URL = (
-    "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-)
-
-# API base URLs — try v3 first, fall back to v2
-UPSTOX_V3 = "https://api.upstox.com/v3"
-UPSTOX_V2 = "https://api.upstox.com/v2"
-
-# Interval mapping:  label → (v3_unit, v3_interval, v2_interval, minutes)
-INTERVAL_MAP = {
-    "5M":  ("minutes", "5",  "5minute",  5),
-    "10M": ("minutes", "10", "10minute", 10),
-}
-
-# Rate-limiting & retry
-API_DELAY_S   = 0.06       # ~16 req/s — well within Upstox limits
-MAX_RETRIES   = 2
-RETRY_DELAY_S = 1.0
-
-# EMA parameters
-EMA_SHORT   = 6
-EMA_LONG    = 30
-MIN_CANDLES = EMA_LONG + 2  # need at least this many for a meaningful cross
-
-# UI auto-refresh while scanner is active (seconds)
-REFRESH_S = 2
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  LOGGING
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("ema_scanner")
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  THREAD-SAFE SCANNER STATE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Module-level dict so it survives Streamlit reruns within the same
-# server process.  Protected by a threading.Lock for safe cross-thread
-# reads and writes.
-
-_lock = threading.Lock()
-
-_scanner: dict = {
-    "running":        False,
-    "stop_requested": False,
-    "signals":        [],          # list[dict]
-    "signal_keys":    set(),       # {(symbol, cross_time_str), …}
-    "progress":       0,
-    "total":          0,
-    "current_stock":  "",
-    "scan_number":    0,
-    "last_scan_time": None,        # datetime | None
-    "next_scan_time": None,        # datetime | None
-    "error_count":    0,
-    "skipped_count":  0,
-    "status":         "Idle",
-    "thread":         None,        # threading.Thread | None
-}
+st.set_page_config(page_title="SMC Intraday Signal Assistant", layout="wide")
 
 
-# ── helpers for thread-safe access ──────────────────────────────
-
-def _get(key=None):
-    """Read one key or the whole state dict (minus non-serialisable bits)."""
-    with _lock:
-        if key is not None:
-            return _scanner[key]
-        return {k: v for k, v in _scanner.items() if k != "thread"}
+# ============================================================================
+# TIME / MARKET HOURS HELPERS
+# ============================================================================
+def now_ist():
+    return datetime.now(IST).replace(tzinfo=None)
 
 
-def _set(**kw):
-    """Update one or more keys."""
-    with _lock:
-        _scanner.update(kw)
-
-
-def _add_signal(sig: dict) -> bool:
-    """Append a signal if not a duplicate. Returns True if added."""
-    with _lock:
-        key = (sig["symbol"], sig["cross_time"])
-        if key in _scanner["signal_keys"]:
-            return False
-        _scanner["signal_keys"].add(key)
-        _scanner["signals"].append(sig)
-        return True
-
-
-def _signals_copy() -> list:
-    with _lock:
-        return list(_scanner["signals"])
-
-
-def _clear_signals():
-    with _lock:
-        _scanner["signals"].clear()
-        _scanner["signal_keys"].clear()
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  TIME UTILITIES
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _now() -> datetime:
-    """Current IST datetime."""
-    return datetime.now(IST)
-
-
-def _is_market_open() -> bool:
-    """True when inside NSE 09:15 – 15:30 on a weekday."""
-    n = _now()
-    if n.weekday() > 4:                    # Saturday / Sunday
+def is_market_open():
+    n = now_ist()
+    if n.weekday() >= 5:
         return False
-    t_open  = n.replace(hour=MARKET_OPEN_H,  minute=MARKET_OPEN_M,
-                        second=0, microsecond=0)
-    t_close = n.replace(hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M,
-                        second=0, microsecond=0)
-    return t_open <= n <= t_close
+    return MARKET_OPEN <= n.time() <= MARKET_CLOSE
 
 
-def _next_candle_boundary(interval_min: int) -> datetime:
-    """IST time when the next candle will *complete* (aligned to 09:15)."""
-    n = _now()
-    mkt_open = n.replace(hour=MARKET_OPEN_H, minute=MARKET_OPEN_M,
-                         second=0, microsecond=0)
-    if n < mkt_open:
-        return mkt_open + timedelta(minutes=interval_min)
-
-    elapsed_s = (n - mkt_open).total_seconds()
-    intervals = int(elapsed_s // (interval_min * 60))
-    return mkt_open + timedelta(minutes=(intervals + 1) * interval_min)
+def market_status_label():
+    if not is_market_open():
+        n = now_ist()
+        if n.weekday() >= 5:
+            return "🔴 CLOSED (Weekend)"
+        if n.time() < MARKET_OPEN:
+            return "🟡 PRE-MARKET (opens 9:15 AM)"
+        return "🔴 CLOSED (market ended 3:30 PM)"
+    return "🟢 OPEN"
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  NSE INSTRUMENT MASTER
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-@st.cache_data(ttl=86_400, show_spinner="📥 Downloading NSE instrument list …")
-def load_instruments() -> pd.DataFrame:
-    """
-    Download the Upstox NSE BOD JSON file and return only equity rows.
-
-    Returns a DataFrame with columns:
-        instrument_key   – e.g. "NSE_EQ|INE002A01018"
-        trading_symbol   – e.g. "RELIANCE"
-        name             – e.g. "RELIANCE INDUSTRIES LIMITED"
-    """
-    resp = requests.get(INSTRUMENTS_URL, timeout=60)
-    resp.raise_for_status()
-
-    with gzip.open(io.BytesIO(resp.content), "rt", encoding="utf-8") as fh:
-        raw = json.load(fh)
-
-    df = pd.DataFrame(raw)
-
-    # Normalise column names (lowercase, underscores)
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-
-    # Filter: segment == "NSE_EQ"  AND  instrument_type == "EQ"
-    mask = pd.Series([False] * len(df))
-    if "segment" in df.columns:
-        mask = mask | (df["segment"].str.upper() == "NSE_EQ")
-    if "instrument_type" in df.columns:
-        mask = mask & (df["instrument_type"].str.upper() == "EQ")
-    if not mask.any() and "instrument_key" in df.columns:
-        mask = df["instrument_key"].str.startswith("NSE_EQ|")
-
-    keep_cols = []
-    for c in ("instrument_key", "trading_symbol", "tradingsymbol", "name"):
-        if c in df.columns:
-            keep_cols.append(c)
-
-    eq = df.loc[mask, keep_cols].copy()
-
-    # Unify the symbol column name
-    if "tradingsymbol" in eq.columns and "trading_symbol" not in eq.columns:
-        eq.rename(columns={"tradingsymbol": "trading_symbol"}, inplace=True)
-    if "trading_symbol" not in eq.columns:
-        raise ValueError(
-            f"Cannot find trading_symbol column. Available: {list(df.columns)}"
-        )
-
-    eq = eq.dropna(subset=["instrument_key", "trading_symbol"])
-    eq = eq.drop_duplicates(subset=["instrument_key"])
-    eq = eq.sort_values("trading_symbol").reset_index(drop=True)
-
-    log.info("Loaded %d NSE equity instruments", len(eq))
-    return eq
+# ============================================================================
+# INSTRUMENT MASTER (symbol -> Upstox instrument_key)
+# ============================================================================
+@st.cache_data(ttl=24 * 3600, show_spinner="Loading NSE instrument list...")
+def load_instruments():
+    df = pd.read_csv(INSTRUMENTS_URL)
+    df = df[df["instrument_type"] == "EQ"]
+    df = df[["instrument_key", "tradingsymbol", "name"]].dropna()
+    return df.reset_index(drop=True)
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  UPSTOX API — CANDLE DATA
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _headers(token: str) -> dict:
-    h = {"Accept": "application/json"}
-    if token:
-        h["Authorization"] = f"Bearer {token}"
-    return h
-
-
-def _fetch_intraday_candles(
-    instrument_key: str,
-    v3_unit: str,
-    v3_interval: str,
-    v2_interval: str,
-    token: str,
-) -> list:
-    """
-    Fetch today's intraday candles.  Tries v3 first, falls back to v2.
-
-    Returns candles sorted ASCENDING by timestamp.
-    Each candle = [timestamp_str, O, H, L, C, Volume, OI]
-    """
-    encoded = quote(instrument_key, safe="")
-    urls = [
-        f"{UPSTOX_V3}/historical-candle/intraday/{encoded}/{v3_unit}/{v3_interval}",
-        f"{UPSTOX_V2}/historical-candle/intraday/{encoded}/{v2_interval}",
-    ]
-    hdrs = _headers(token)
-
-    for url in urls:
-        for attempt in range(MAX_RETRIES + 1):
-            try:
-                r = requests.get(url, headers=hdrs, timeout=10)
-
-                if r.status_code == 429:                     # rate-limited
-                    wait = float(r.headers.get("Retry-After", RETRY_DELAY_S))
-                    time.sleep(max(wait, RETRY_DELAY_S))
-                    continue
-
-                if r.status_code == 401:
-                    raise PermissionError("Invalid or expired access token")
-
-                if r.status_code >= 400:
-                    break                                    # try next URL
-
-                body = r.json()
-                if body.get("status") != "success":
-                    break
-
-                candles = body.get("data", {}).get("candles", [])
-                if candles:
-                    candles.sort(key=lambda c: c[0])         # ascending
-                    return candles
-
-            except PermissionError:
-                raise
-            except requests.RequestException:
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY_S)
-                continue
-            except Exception:
-                break
-        # If v3 failed, try v2 next
-        continue
-
-    return []
-
-
-def _fetch_historical_candles(
-    instrument_key: str,
-    v3_unit: str,
-    v3_interval: str,
-    v2_interval: str,
-    token: str,
-    lookback_days: int = 7,
-) -> list:
-    """
-    Fetch historical candles for *past* days (up to but NOT including today).
-    Used to bootstrap EMA calculations early in the session.
-    """
-    encoded = quote(instrument_key, safe="")
-    today = _now().date()
-    yesterday = today - timedelta(days=1)
-    from_date = (today - timedelta(days=lookback_days)).isoformat()
-    to_date = yesterday.isoformat()
-
-    urls = [
-        f"{UPSTOX_V3}/historical-candle/{encoded}/{v3_unit}/{v3_interval}/{to_date}/{from_date}",
-        f"{UPSTOX_V2}/historical-candle/{encoded}/{v2_interval}/{to_date}/{from_date}",
-    ]
-    hdrs = _headers(token)
-
-    for url in urls:
-        for attempt in range(MAX_RETRIES + 1):
-            try:
-                r = requests.get(url, headers=hdrs, timeout=10)
-
-                if r.status_code == 429:
-                    wait = float(r.headers.get("Retry-After", RETRY_DELAY_S))
-                    time.sleep(max(wait, RETRY_DELAY_S))
-                    continue
-                if r.status_code >= 400:
-                    break
-
-                body = r.json()
-                if body.get("status") == "success":
-                    candles = body.get("data", {}).get("candles", [])
-                    if candles:
-                        candles.sort(key=lambda c: c[0])
-                        return candles
-                break
-
-            except requests.RequestException:
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY_S)
-                continue
-            except Exception:
-                break
-        continue
-
-    return []
-
-
-def fetch_candles(
-    instrument_key: str,
-    v3_unit: str,
-    v3_interval: str,
-    v2_interval: str,
-    token: str,
-    hist_cache: dict,
-) -> list:
-    """
-    Return a merged, ascending candle list combining:
-      • cached historical candles (previous days)
-      • fresh intraday candles (today)
-
-    This ensures EMA 30 has enough look-back even early in the session.
-    """
-    # 1. Historical (cached per instrument_key per day)
-    cache_key = instrument_key
-    if cache_key not in hist_cache:
-        hist = _fetch_historical_candles(
-            instrument_key, v3_unit, v3_interval, v2_interval, token
-        )
-        hist_cache[cache_key] = hist
-        time.sleep(API_DELAY_S)
-
-    historical = hist_cache.get(cache_key, [])
-
-    # 2. Intraday (always fresh)
-    intraday = _fetch_intraday_candles(
-        instrument_key, v3_unit, v3_interval, v2_interval, token
+def search_instrument(df, query):
+    q = query.strip().upper()
+    if not q:
+        return pd.DataFrame()
+    mask = df["tradingsymbol"].str.upper().str.contains(q, na=False) | df["name"].str.upper().str.contains(
+        q, na=False
     )
-
-    # 3. Merge & deduplicate by timestamp
-    seen = set()
-    merged = []
-    for c in historical + intraday:
-        ts = c[0]
-        if ts not in seen:
-            seen.add(ts)
-            merged.append(c)
-
-    merged.sort(key=lambda c: c[0])
-    return merged
+    return df[mask].head(25)
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  COMPLETED-CANDLE FILTER
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ============================================================================
+# DATA FETCH (Upstox v2) — historical + intraday, merged and resampled
+# ============================================================================
+def api_headers(token):
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
-def _completed_candles(candles: list, interval_min: int, cutoff: datetime) -> list:
-    """
-    Return only candles whose interval has *fully elapsed* by *cutoff*.
-    Candle timestamp = interval START, so a candle is complete when
-    start + interval_minutes <= cutoff.
-    """
-    delta = timedelta(minutes=interval_min)
-    out = []
-    for c in candles:
-        try:
-            ts = pd.Timestamp(c[0])
-            if ts.tzinfo is None:
-                ts = ts.tz_localize(IST)
-            else:
-                ts = ts.tz_convert(IST)
-            if (ts + delta) <= cutoff:
-                out.append(c)
-        except Exception:
-            continue
+
+def candles_to_df(candles):
+    cols = ["timestamp", "open", "high", "low", "close", "volume", "oi"]
+    if not candles:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(candles, columns=cols)
+    ts = pd.to_datetime(df["timestamp"])
+    if getattr(ts.dt, "tz", None) is not None:
+        ts = ts.dt.tz_convert(IST).dt.tz_localize(None)
+    df["timestamp"] = ts
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    return df[["timestamp", "open", "high", "low", "close", "volume"]]
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_intraday_1m(instrument_key, token):
+    url = f"{UPSTOX_BASE}/historical-candle/intraday/{instrument_key}/1minute"
+    r = requests.get(url, headers=api_headers(token), timeout=10)
+    r.raise_for_status()
+    candles = r.json().get("data", {}).get("candles", [])
+    return candles_to_df(candles)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_historical_1m(instrument_key, token, from_date, to_date):
+    url = f"{UPSTOX_BASE}/historical-candle/{instrument_key}/1minute/{to_date}/{from_date}"
+    r = requests.get(url, headers=api_headers(token), timeout=10)
+    r.raise_for_status()
+    candles = r.json().get("data", {}).get("candles", [])
+    return candles_to_df(candles)
+
+
+def resample(df, tf_minutes):
+    d = df.set_index("timestamp")
+    o = d.resample(f"{tf_minutes}min", label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    )
+    o = o.dropna(subset=["open", "high", "low", "close"])
+    return o.reset_index()
+
+
+def get_completed_candles(instrument_key, token, tf_minutes):
+    """Fetch 1-min data, resample to tf_minutes, and DROP the still-forming
+    last candle so the engine never looks at an incomplete bar."""
+    today = now_ist().strftime("%Y-%m-%d")
+    from_date = (now_ist() - timedelta(days=6)).strftime("%Y-%m-%d")
+
+    hist = pd.DataFrame()
+    intraday = pd.DataFrame()
+    err = None
+    try:
+        hist = fetch_historical_1m(instrument_key, token, from_date, today)
+    except Exception as e:
+        err = str(e)
+    try:
+        intraday = fetch_intraday_1m(instrument_key, token)
+    except Exception as e:
+        err = str(e)
+
+    df = pd.concat([hist, intraday], ignore_index=True)
+    if df.empty:
+        return df, err
+    df = df.drop_duplicates(subset="timestamp").sort_values("timestamp").reset_index(drop=True)
+
+    df = resample(df, tf_minutes)
+    if df.empty:
+        return df, err
+
+    n = now_ist()
+    last_start = df.iloc[-1]["timestamp"]
+    if last_start + timedelta(minutes=tf_minutes) > n:
+        df = df.iloc[:-1]  # drop forming candle -> no look-ahead / no repaint
+
+    return df.reset_index(drop=True), err
+
+
+# ============================================================================
+# SMC ANALYSIS ENGINE
+# ============================================================================
+def find_swings(df, left=2, right=2):
+    """Fractal swing highs/lows using a symmetric lookback window."""
+    highs = df["high"].values
+    lows = df["low"].values
+    n = len(df)
+    sh = [False] * n
+    sl = [False] * n
+    for i in range(left, n - right):
+        wh = highs[i - left : i + right + 1]
+        wl = lows[i - left : i + right + 1]
+        if highs[i] == wh.max() and list(wh).count(highs[i]) == 1:
+            sh[i] = True
+        if lows[i] == wl.min() and list(wl).count(lows[i]) == 1:
+            sl[i] = True
+    out = df.copy()
+    out["swing_high"] = sh
+    out["swing_low"] = sl
     return out
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  EMA & CROSSOVER LOGIC
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def market_structure(df):
+    """Walk candles chronologically; whenever a close breaks the most recent
+    confirmed swing high/low, log a BOS (trend continuation) or CHoCH (trend
+    reversal) event. Each swing level can only trigger one event (no dupes)."""
+    events = []
+    swing_highs = df[df["swing_high"]][["high"]].copy()
+    swing_lows = df[df["swing_low"]][["low"]].copy()
 
-def _compute_emas(closes: list):
-    """Return (ema_short, ema_long) as pandas Series."""
-    s = pd.Series(closes, dtype=float)
-    return (
-        s.ewm(span=EMA_SHORT, adjust=False).mean(),
-        s.ewm(span=EMA_LONG,  adjust=False).mean(),
-    )
+    trend = None
+    broken_sh, broken_sl = set(), set()
 
+    for i in range(len(df)):
+        close = df["close"].iloc[i]
+        ts = df["timestamp"].iloc[i]
 
-def detect_crossover(closes: list, timestamps: list):
-    """
-    Check the two most recent completed candles for an EMA 6/30 crossover.
+        sh_before = swing_highs[swing_highs.index < i]
+        sl_before = swing_lows[swing_lows.index < i]
+        cur_sh = sh_before["high"].iloc[-1] if len(sh_before) else None
+        cur_sl = sl_before["low"].iloc[-1] if len(sl_before) else None
 
-    Returns a dict with signal details, or None.
-    """
-    if len(closes) < MIN_CANDLES:
-        return None
+        if cur_sh is not None and close > cur_sh and cur_sh not in broken_sh:
+            etype = "BOS" if trend in (None, "up") else "CHoCH"
+            events.append(dict(idx=i, timestamp=ts, type=etype, direction="bull", price=cur_sh))
+            trend = "up"
+            broken_sh.add(cur_sh)
+        if cur_sl is not None and close < cur_sl and cur_sl not in broken_sl:
+            etype = "BOS" if trend in (None, "down") else "CHoCH"
+            events.append(dict(idx=i, timestamp=ts, type=etype, direction="bear", price=cur_sl))
+            trend = "down"
+            broken_sl.add(cur_sl)
 
-    ema6, ema30 = _compute_emas(closes)
-
-    cur6, cur30 = ema6.iloc[-1], ema30.iloc[-1]
-    prv6, prv30 = ema6.iloc[-2], ema30.iloc[-2]
-
-    sig = None
-    if prv6 <= prv30 and cur6 > cur30:
-        sig = "BUY"
-    elif prv6 >= prv30 and cur6 < cur30:
-        sig = "SELL"
-
-    if sig is None:
-        return None
-
-    return {
-        "signal":      sig,
-        "ema6":        round(float(cur6), 2),
-        "ema30":       round(float(cur30), 2),
-        "cross_price": round(float(closes[-1]), 2),
-        "cross_time":  timestamps[-1],
-    }
+    return events, trend
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  SCAN ENGINE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _run_scan(
-    instruments: pd.DataFrame,
-    v3_unit: str,
-    v3_interval: str,
-    v2_interval: str,
-    interval_min: int,
-    token: str,
-    hist_cache: dict,
-):
-    """Scan every instrument once.  Called from the background thread."""
-    cutoff = _now()                                 # fix boundary for the pass
-    total  = len(instruments)
-    with _lock:
-        _scanner["scan_number"] += 1
-        _scanner["skipped_count"] = 0
-    scan_no = _get("scan_number")
-    _set(progress=0, total=total)
-    found = 0
-
-    for idx, row in instruments.iterrows():
-        if _scanner["stop_requested"]:
-            return
-
-        ikey   = row["instrument_key"]
-        symbol = row["trading_symbol"]
-        _set(
-            progress=idx + 1,
-            current_stock=symbol,
-            status=f"[Scan #{scan_no}]  {symbol}  ({idx + 1}/{total})",
-        )
-
-        try:
-            raw = fetch_candles(
-                ikey, v3_unit, v3_interval, v2_interval, token, hist_cache
+def detect_liquidity_sweeps(df, lookback=20):
+    """A sweep = price wicks beyond a recent swing extreme but CLOSES back
+    inside it -> stop-hunt / liquidity grab, often precedes a reversal."""
+    sweeps = []
+    for i in range(lookback, len(df)):
+        window = df.iloc[i - lookback : i]
+        recent_high = window.loc[window["swing_high"], "high"].max() if window["swing_high"].any() else None
+        recent_low = window.loc[window["swing_low"], "low"].min() if window["swing_low"].any() else None
+        row = df.iloc[i]
+        if recent_high is not None and row["high"] > recent_high and row["close"] < recent_high:
+            sweeps.append(
+                dict(idx=i, timestamp=row["timestamp"], type="sell_side_sweep", level=float(recent_high), direction="bullish")
             )
-            if not raw:
-                with _lock:
-                    _scanner["skipped_count"] += 1
-                time.sleep(API_DELAY_S)
-                continue
+        if recent_low is not None and row["low"] < recent_low and row["close"] > recent_low:
+            sweeps.append(
+                dict(idx=i, timestamp=row["timestamp"], type="buy_side_sweep", level=float(recent_low), direction="bearish")
+            )
+    return sweeps
 
-            done = _completed_candles(raw, interval_min, cutoff)
-            if len(done) < MIN_CANDLES:
-                with _lock:
-                    _scanner["skipped_count"] += 1
-                time.sleep(API_DELAY_S)
-                continue
 
-            closes     = [c[4] for c in done]
-            timestamps = [c[0] for c in done]
-            result     = detect_crossover(closes, timestamps)
+def detect_fvg(df):
+    """3-candle Fair Value Gap / imbalance."""
+    fvgs = []
+    for i in range(2, len(df)):
+        c1, c3 = df.iloc[i - 2], df.iloc[i]
+        if c1["high"] < c3["low"]:
+            fvgs.append(dict(idx=i, timestamp=df.iloc[i - 1]["timestamp"], type="bullish_fvg", top=float(c3["low"]), bottom=float(c1["high"])))
+        if c1["low"] > c3["high"]:
+            fvgs.append(dict(idx=i, timestamp=df.iloc[i - 1]["timestamp"], type="bearish_fvg", top=float(c1["low"]), bottom=float(c3["high"])))
+    return fvgs
 
-            if result:
-                result.update(
-                    symbol=symbol,
-                    instrument_key=ikey,
-                    timeframe=f"{interval_min}M",
-                    scan_number=scan_no,
+
+def detect_displacement(df, atr_period=14, mult=1.5):
+    """Momentum candle: body notably larger than recent average range."""
+    body = (df["close"] - df["open"]).abs()
+    rng = df["high"] - df["low"]
+    atr = rng.rolling(atr_period, min_periods=5).mean()
+    return body > (atr * mult)
+
+
+def detect_order_blocks(df, events, disp_series):
+    """For each structural break, find the last opposite-colour candle right
+    before the displacement leg that caused it -> that candle is the OB."""
+    obs = []
+    for ev in events:
+        i, direction = ev["idx"], ev["direction"]
+        start = max(0, i - 10)
+        found = None
+        for j in range(i, start, -1):
+            if j < len(disp_series) and bool(disp_series.iloc[j]):
+                k = j - 1
+                if k >= 0:
+                    o, c = df["open"].iloc[k], df["close"].iloc[k]
+                    if direction == "bull" and c < o:
+                        found = k
+                    elif direction == "bear" and c > o:
+                        found = k
+                break
+        if found is not None:
+            row = df.iloc[found]
+            obs.append(
+                dict(
+                    idx=found,
+                    timestamp=row["timestamp"],
+                    type="bullish_ob" if direction == "bull" else "bearish_ob",
+                    top=float(row["high"]),
+                    bottom=float(row["low"]),
+                    event_idx=i,
                 )
-                if _add_signal(result):
-                    found += 1
-                    log.info(
-                        "SIGNAL  %s  %s  @ %.2f  [%s]",
-                        result["signal"], symbol,
-                        result["cross_price"], result["cross_time"],
-                    )
+            )
+    return obs
 
-        except PermissionError:
-            _set(running=False, status="❌ Invalid / expired access token")
-            return
-        except Exception as exc:
-            with _lock:
-                _scanner["error_count"] += 1
-            log.warning("Error scanning %s: %s", symbol, exc)
 
-        time.sleep(API_DELAY_S)
+def generate_signal(df):
+    """Combine sweep -> CHoCH/BOS confirmation -> OB/FVG retracement zone
+    -> confirmation candle, into a single actionable BUY/SELL/WAIT signal."""
+    df = find_swings(df)
+    events, trend = market_structure(df)
+    sweeps = detect_liquidity_sweeps(df)
+    fvgs = detect_fvg(df)
+    disp = detect_displacement(df)
+    obs = detect_order_blocks(df, events, disp)
 
-    total_signals = len(_signals_copy())
-    _set(
-        last_scan_time=_now(),
-        current_stock="",
-        status=(
-            f"Scan #{scan_no} done — {found} new signal(s), "
-            f"{total_signals} total"
-        ),
-    )
-    log.info(
-        "Scan #%d complete: %d new signals, %d total, %d errors, %d skipped",
-        scan_no, found, total_signals,
-        _get("error_count"), _get("skipped_count"),
+    result = dict(
+        signal="WAIT", reason="", entry=None, sl=None, target=None, trend=trend,
+        events=events, sweeps=sweeps, fvgs=fvgs, obs=obs, disp=disp, df=df,
     )
 
+    if len(df) < 30:
+        result["reason"] = "Collecting data — need more completed candles before analysis is reliable."
+        return result
 
-def _scanner_loop(
-    instruments: pd.DataFrame,
-    v3_unit: str,
-    v3_interval: str,
-    v2_interval: str,
-    interval_min: int,
-    token: str,
-):
-    """Background-thread entry point.  Manages the scan schedule."""
-    _set(running=True, stop_requested=False, error_count=0, skipped_count=0)
-    hist_cache: dict = {}           # populated lazily, lives for the session
+    last_price = float(df["close"].iloc[-1])
+    last_idx = len(df) - 1
+    lookback_bars = 15
 
-    try:
-        # If outside market hours, wait (check every 10 s)
-        if not _is_market_open():
-            _set(status="⏳ Waiting for market to open …")
-            while not _is_market_open() and not _scanner["stop_requested"]:
-                n = _now()
-                mkt = n.replace(hour=MARKET_OPEN_H, minute=MARKET_OPEN_M,
-                                second=0, microsecond=0)
-                if n > mkt:                          # already past open today
-                    _set(status="Market closed for the day.")
-                    return
-                time.sleep(10)
-            if _scanner["stop_requested"]:
-                return
+    recent_sweeps = [s for s in sweeps if s["idx"] >= last_idx - lookback_bars]
 
-        # ── Immediate first scan ────────────────────────────────
-        _run_scan(instruments, v3_unit, v3_interval, v2_interval,
-                  interval_min, token, hist_cache)
+    bullish_setup = None
+    bearish_setup = None
+    for sw in recent_sweeps:
+        if sw["direction"] == "bullish":
+            confirm = [e for e in events if e["idx"] > sw["idx"] and e["direction"] == "bull"]
+            if confirm:
+                bullish_setup = (sw, confirm[0])
+        if sw["direction"] == "bearish":
+            confirm = [e for e in events if e["idx"] > sw["idx"] and e["direction"] == "bear"]
+            if confirm:
+                bearish_setup = (sw, confirm[0])
 
-        # ── Scheduled loop ──────────────────────────────────────
-        while not _scanner["stop_requested"]:
-            if not _is_market_open():
-                _set(status="Market closed for the day.")
-                break
+    def nearest_zone(after_idx, direction):
+        pool = obs + fvgs
+        cands = [
+            z for z in pool
+            if z["idx"] >= after_idx
+            and (("bullish" in z["type"]) if direction == "bull" else ("bearish" in z["type"]))
+        ]
+        if not cands:
+            return None
+        cands.sort(key=lambda z: abs(last_price - (z["top"] + z["bottom"]) / 2))
+        return cands[0]
 
-            nxt = _next_candle_boundary(interval_min)
-            _set(next_scan_time=nxt,
-                 status=f"Next scan at {nxt.strftime('%H:%M:%S')} IST")
-
-            # Wait until the candle completes
-            while _now() < nxt and not _scanner["stop_requested"]:
-                time.sleep(1)
-
-            if _scanner["stop_requested"] or not _is_market_open():
-                break
-
-            # Small buffer so Upstox has flushed the completed candle
-            time.sleep(3)
-
-            _run_scan(instruments, v3_unit, v3_interval, v2_interval,
-                      interval_min, token, hist_cache)
-
-    finally:
-        _set(running=False, next_scan_time=None,
-             status="Scanner stopped")
-        log.info("Scanner thread exited")
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  STREAMLIT UI
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _format_age(cross_time_str: str) -> str:
-    """Human-readable age string for a crossover timestamp."""
-    try:
-        ts = pd.Timestamp(cross_time_str)
-        if ts.tzinfo is None:
-            ts = ts.tz_localize(IST)
+    if bullish_setup:
+        sw, choch = bullish_setup
+        zone = nearest_zone(choch["idx"], "bull")
+        if zone:
+            top, bottom = zone["top"], zone["bottom"]
+            in_zone = bottom <= last_price <= top * 1.002
+            confirm_candle = df["close"].iloc[-1] > df["open"].iloc[-1]
+            if in_zone and confirm_candle:
+                entry = last_price
+                sl = min(sw["level"], bottom) * 0.999
+                risk = max(entry - sl, 0.01)
+                future_highs = df.loc[df["swing_high"], "high"]
+                targets = future_highs[future_highs > entry]
+                target = float(targets.min()) if len(targets) else entry + risk * 2
+                result.update(
+                    signal="BUY",
+                    reason=(
+                        f"Buy-side liquidity swept at {sw['level']:.2f}, followed by a bullish "
+                        f"{choch['type']}. Price reacted from a {zone['type'].replace('_', ' ')} zone "
+                        f"({bottom:.2f}–{top:.2f}) with a bullish confirmation candle."
+                    ),
+                    entry=round(entry, 2), sl=round(sl, 2), target=round(target, 2),
+                )
+                return result
+            result["reason"] = (
+                f"Bullish sweep + {choch['type']} confirmed. Waiting for price to tap into "
+                f"{zone['type'].replace('_', ' ')} zone ({bottom:.2f}–{top:.2f}) with a bullish close."
+            )
         else:
-            ts = ts.tz_convert(IST)
-        secs = (_now() - ts).total_seconds()
-        if secs < 0:
-            return "just now"
-        if secs < 60:
-            return f"{int(secs)}s ago"
-        if secs < 3600:
-            return f"{int(secs // 60)}m ago"
-        hrs = int(secs // 3600)
-        mins = int((secs % 3600) // 60)
-        return f"{hrs}h {mins}m ago"
-    except Exception:
-        return "–"
+            result["reason"] = "Bullish sweep + CHoCH detected, but no clear OB/FVG retracement zone yet."
 
-
-def _format_cross_time(cross_time_str: str) -> str:
-    """Pretty-print the crossover candle timestamp."""
-    try:
-        ts = pd.Timestamp(cross_time_str)
-        if ts.tzinfo is None:
-            ts = ts.tz_localize(IST)
+    if bearish_setup and result["signal"] == "WAIT":
+        sw, choch = bearish_setup
+        zone = nearest_zone(choch["idx"], "bear")
+        if zone:
+            top, bottom = zone["top"], zone["bottom"]
+            in_zone = bottom * 0.998 <= last_price <= top
+            confirm_candle = df["close"].iloc[-1] < df["open"].iloc[-1]
+            if in_zone and confirm_candle:
+                entry = last_price
+                sl = max(sw["level"], top) * 1.001
+                risk = max(sl - entry, 0.01)
+                future_lows = df.loc[df["swing_low"], "low"]
+                targets = future_lows[future_lows < entry]
+                target = float(targets.max()) if len(targets) else entry - risk * 2
+                result.update(
+                    signal="SELL",
+                    reason=(
+                        f"Sell-side liquidity swept at {sw['level']:.2f}, followed by a bearish "
+                        f"{choch['type']}. Price reacted from a {zone['type'].replace('_', ' ')} zone "
+                        f"({bottom:.2f}–{top:.2f}) with a bearish confirmation candle."
+                    ),
+                    entry=round(entry, 2), sl=round(sl, 2), target=round(target, 2),
+                )
+                return result
+            result["reason"] = (
+                f"Bearish sweep + {choch['type']} confirmed. Waiting for price to tap into "
+                f"{zone['type'].replace('_', ' ')} zone ({bottom:.2f}–{top:.2f}) with a bearish close."
+            )
         else:
-            ts = ts.tz_convert(IST)
-        return ts.strftime("%d-%b %H:%M")
-    except Exception:
-        return cross_time_str
+            result["reason"] = "Bearish sweep + CHoCH detected, but no clear OB/FVG retracement zone yet."
+
+    if result["signal"] == "WAIT" and not result["reason"]:
+        result["reason"] = "No high-probability SMC setup right now (no recent sweep+structure-shift combo). Monitoring..."
+
+    return result
 
 
-def main():
-    # ── Page config ─────────────────────────────────────────────
-    st.set_page_config(
-        page_title="NSE EMA Scanner",
-        page_icon="📊",
-        layout="wide",
+# ============================================================================
+# CHART
+# ============================================================================
+def build_chart(res, symbol, tf_minutes):
+    df = res["df"]
+    fig = go.Figure()
+    fig.add_trace(
+        go.Candlestick(
+            x=df["timestamp"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+            name=symbol, increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        )
     )
 
-    st.title("📊 NSE EMA 6 / 30 Crossover Scanner")
-    st.caption(
-        "Powered by Upstox API  ·  Analysis & alerts only — "
-        "**no trades are placed**"
+    for ob in res["obs"]:
+        color = "rgba(38,166,154,0.20)" if "bullish" in ob["type"] else "rgba(239,83,80,0.20)"
+        fig.add_shape(
+            type="rect", x0=ob["timestamp"], x1=df["timestamp"].iloc[-1],
+            y0=ob["bottom"], y1=ob["top"], fillcolor=color, line=dict(width=0), layer="below",
+        )
+
+    for fv in res["fvgs"][-15:]:
+        color = "rgba(41,98,255,0.15)" if "bullish" in fv["type"] else "rgba(255,152,0,0.15)"
+        fig.add_shape(
+            type="rect", x0=fv["timestamp"], x1=df["timestamp"].iloc[-1],
+            y0=fv["bottom"], y1=fv["top"], fillcolor=color, line=dict(width=0), layer="below",
+        )
+
+    for sw in res["sweeps"][-10:]:
+        fig.add_trace(
+            go.Scatter(
+                x=[sw["timestamp"]], y=[sw["level"]], mode="markers",
+                marker=dict(symbol="x", size=10, color="#ffca28"),
+                name="Liquidity Sweep", showlegend=False,
+                hovertext=f"{sw['type']} @ {sw['level']:.2f}",
+            )
+        )
+
+    for ev in res["events"][-12:]:
+        color = "#26a69a" if ev["direction"] == "bull" else "#ef5350"
+        fig.add_annotation(
+            x=ev["timestamp"], y=ev["price"], text=ev["type"], showarrow=True, arrowhead=1,
+            arrowcolor=color, font=dict(color=color, size=10), yshift=15 if ev["direction"] == "bull" else -15,
+        )
+
+    if res["signal"] in ("BUY", "SELL") and res["entry"]:
+        fig.add_hline(y=res["entry"], line_dash="dot", line_color="#2962ff", annotation_text="Entry")
+        fig.add_hline(y=res["sl"], line_dash="dot", line_color="#ef5350", annotation_text="Stop Loss")
+        fig.add_hline(y=res["target"], line_dash="dot", line_color="#26a69a", annotation_text="Target")
+
+    fig.update_layout(
+        title=f"{symbol} — {tf_minutes}min (SMC view)", xaxis_rangeslider_visible=False,
+        height=560, margin=dict(l=10, r=10, t=40, b=10), template="plotly_dark",
     )
+    return fig
 
-    # ── Sidebar ─────────────────────────────────────────────────
-    with st.sidebar:
-        st.header("⚙️ Settings")
 
-        token = st.text_input(
-            "Upstox Access Token",
-            type="password",
-            help="Paste your Upstox API v2/v3 bearer token.",
-        )
+# ============================================================================
+# SESSION STATE INIT
+# ============================================================================
+for key, default in [
+    ("active_trade", None), ("trade_log", []), ("monitoring", False),
+    ("selected_symbol", None), ("selected_key", None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-        timeframe = st.selectbox(
-            "Candle Timeframe",
-            options=list(INTERVAL_MAP.keys()),
-            index=0,
-        )
 
-        st.divider()
+# ============================================================================
+# SIDEBAR
+# ============================================================================
+st.sidebar.title("⚙️ Setup")
+access_token = st.sidebar.text_input("Upstox API v2 access token", type="password")
+tf_minutes = st.sidebar.selectbox("Timeframe", [1, 3, 5, 15], index=2, format_func=lambda x: f"{x} min")
+refresh_sec = st.sidebar.slider("Auto-refresh every (sec)", 15, 120, 30, step=5)
 
-        c1, c2 = st.columns(2)
-        start_btn = c1.button("▶️ Start", use_container_width=True)
-        stop_btn  = c2.button("⏹ Stop",  use_container_width=True)
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔎 Find a stock")
+query = st.sidebar.text_input("Stock name / symbol", placeholder="e.g. RELIANCE, TCS, HDFC BANK")
 
-        if st.button("🗑️ Clear Signals", use_container_width=True):
-            _clear_signals()
-            st.rerun()
+instrument_key, symbol_label = None, None
+if access_token and query:
+    try:
+        inst_df = load_instruments()
+        matches = search_instrument(inst_df, query)
+        if len(matches):
+            options = {f"{r.tradingsymbol} — {r.name}": r.instrument_key for r in matches.itertuples()}
+            choice = st.sidebar.selectbox("Matches", list(options.keys()))
+            instrument_key = options[choice]
+            symbol_label = choice.split(" — ")[0]
+        else:
+            st.sidebar.warning("No matches found.")
+    except Exception as e:
+        st.sidebar.error(f"Could not load instrument list: {e}")
+elif not access_token:
+    st.sidebar.info("Paste your Upstox access token to search stocks.")
 
-        st.divider()
+st.sidebar.markdown("---")
+col_a, col_b = st.sidebar.columns(2)
+if col_a.button("▶ Start Monitoring", use_container_width=True, disabled=not instrument_key):
+    st.session_state.monitoring = True
+    st.session_state.selected_symbol = symbol_label
+    st.session_state.selected_key = instrument_key
+    st.session_state.active_trade = None
+if col_b.button("⏹ Stop", use_container_width=True):
+    st.session_state.monitoring = False
 
-        # Status panel
-        st.subheader("📡 Status")
-        snap = _get()
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    "⚠️ This tool NEVER places, modifies or cancels orders. It only analyzes "
+    "completed candles and shows you Entry / Stop Loss / Target for manual execution."
+)
 
-        now_str = _now().strftime("%H:%M:%S")
-        mkt     = "🟢 Open" if _is_market_open() else "🔴 Closed"
-        st.caption(f"🕐 IST {now_str}  ·  Market: {mkt}")
+if not HAS_AUTOREFRESH:
+    st.sidebar.caption("Tip: `pip install streamlit-autorefresh` for live auto-refresh during market hours.")
 
-        colour = "🟢" if snap["running"] else "🔴"
-        st.markdown(f"{colour} **{snap['status']}**")
 
-        if snap["running"] and snap["total"] > 0:
-            pct = snap["progress"] / snap["total"]
-            st.progress(
-                pct,
-                text=(
-                    f"{snap['current_stock']}  "
-                    f"({snap['progress']}/{snap['total']})"
-                ),
-            )
+# ============================================================================
+# MAIN AREA
+# ============================================================================
+st.title("📈 SMC Intraday Signal Assistant")
+st.caption("Break of Structure • Change of Character • Liquidity Sweeps • Order Blocks • FVG • Displacement")
 
-        if snap["last_scan_time"]:
-            st.caption(
-                f"Last scan: {snap['last_scan_time'].strftime('%H:%M:%S')} IST"
-            )
-        if snap["next_scan_time"]:
-            st.caption(
-                f"Next scan: {snap['next_scan_time'].strftime('%H:%M:%S')} IST"
-            )
+top1, top2, top3 = st.columns([2, 2, 3])
+top1.metric("Market", market_status_label())
+top2.metric("Now (IST)", now_ist().strftime("%H:%M:%S"))
+top3.metric("Selected", st.session_state.selected_symbol or "—")
 
-        st.caption(f"Scans completed: {snap['scan_number']}")
-        st.caption(f"API errors: {snap['error_count']}")
-        st.caption(f"Stocks skipped (insufficient data): {snap['skipped_count']}")
+st.markdown(
+    "> **Disclaimer:** Educational decision-support only. SMC signals are rule-based approximations "
+    "of a discretionary methodology and can be wrong. No order is ever placed automatically — "
+    "you decide whether, when and how to execute."
+)
 
-    # ── Handle START ────────────────────────────────────────────
-    if start_btn:
-        if not token:
-            st.error("⚠️ Please enter your Upstox access token in the sidebar.")
-            st.stop()
+if not st.session_state.monitoring or not st.session_state.selected_key:
+    st.info("Enter your access token, search a stock, and click **Start Monitoring** in the sidebar.")
+    st.stop()
 
-        # Guard against duplicate threads
-        if snap["running"]:
-            th = _scanner.get("thread")
-            if th and th.is_alive():
-                st.warning("Scanner is already running.")
-                st.stop()
-            else:
-                _set(running=False)
-
-        # Load instruments
-        try:
-            instruments = load_instruments()
-            st.sidebar.success(f"✅ Loaded {len(instruments)} NSE equities")
-        except Exception as exc:
-            st.error(f"Failed to load instruments: {exc}")
-            st.stop()
-
-        v3_unit, v3_interval, v2_interval, interval_min = INTERVAL_MAP[timeframe]
-
-        th = threading.Thread(
-            target=_scanner_loop,
-            args=(instruments, v3_unit, v3_interval, v2_interval,
-                  interval_min, token),
-            daemon=True,
-            name="ema_scanner",
-        )
-        with _lock:
-            _scanner["thread"] = th
-        th.start()
-
-        log.info(
-            "Scanner started: %s (%d stocks)",
-            timeframe, len(instruments),
-        )
-        time.sleep(0.5)
+if HAS_AUTOREFRESH and is_market_open():
+    st_autorefresh(interval=refresh_sec * 1000, key="live_refresh")
+elif not is_market_open():
+    st.warning("Market is currently closed (NSE hours: 9:15 AM – 3:30 PM, Mon–Fri). Showing last available data.")
+    if st.button("🔄 Refresh now"):
+        st.rerun()
+else:
+    if st.button("🔄 Refresh now"):
         st.rerun()
 
-    # ── Handle STOP ─────────────────────────────────────────────
-    if stop_btn:
-        _set(stop_requested=True)
-        st.toast("⏹ Stop requested — scanner will halt after the current stock.")
-        time.sleep(1)
-        st.rerun()
+# ---- Fetch + analyze ----
+df, err = get_completed_candles(st.session_state.selected_key, access_token, tf_minutes)
 
-    # ── About ───────────────────────────────────────────────────
-    with st.expander("ℹ️  About this scanner", expanded=False):
-        st.markdown(f"""
-| Parameter | Value |
-|---|---|
-| Short EMA | **{EMA_SHORT}** |
-| Long EMA | **{EMA_LONG}** |
-| Min candles needed | **{MIN_CANDLES}** |
-| Scan interval | Aligned to candle close |
-| Market hours | 09:15 – 15:30 IST (Mon – Fri) |
+if df.empty:
+    st.error(f"No candle data returned yet. {('Error: ' + err) if err else 'Try again in a moment, or check your access token.'}")
+    st.stop()
 
-**BUY signal** — EMA {EMA_SHORT} crosses *above* EMA {EMA_LONG}
-on the latest completed candle.
+res = generate_signal(df)
 
-**SELL signal** — EMA {EMA_SHORT} crosses *below* EMA {EMA_LONG}
-on the latest completed candle.
-
-Historical data from the last 7 trading days is fetched once per
-stock on the first scan so that EMA 30 is accurate even at market
-open.  Subsequent scans reuse the cached historical data and
-fetch only today's intraday candles.
-
-⚠️ **No trades are ever placed.  This is analysis only.**
-        """)
-
-    # ── Signal Dashboard ────────────────────────────────────────
-    st.header("📋 Signal Dashboard")
-
-    signals = _signals_copy()
-
-    if not signals:
-        st.info(
-            "No crossover signals detected yet.  "
-            "Press **▶️ Start** to begin scanning."
+# ---- Manage active trade lifecycle (ENTER / EXIT) ----
+last_row = df.iloc[-1]
+exit_note = None
+if st.session_state.active_trade is None:
+    if res["signal"] in ("BUY", "SELL"):
+        st.session_state.active_trade = dict(
+            direction=res["signal"], entry=res["entry"], sl=res["sl"], target=res["target"],
+            entry_time=str(last_row["timestamp"]),
         )
+else:
+    trade = st.session_state.active_trade
+    if trade["direction"] == "BUY":
+        if last_row["low"] <= trade["sl"]:
+            exit_note = ("STOP LOSS HIT", trade["sl"])
+        elif last_row["high"] >= trade["target"]:
+            exit_note = ("TARGET HIT", trade["target"])
     else:
-        # Sort by crossover time descending (most recent first)
-        sigs = sorted(signals, key=lambda s: s["cross_time"], reverse=True)
+        if last_row["high"] >= trade["sl"]:
+            exit_note = ("STOP LOSS HIT", trade["sl"])
+        elif last_row["low"] <= trade["target"]:
+            exit_note = ("TARGET HIT", trade["target"])
 
-        buy_n  = sum(1 for s in sigs if s["signal"] == "BUY")
-        sell_n = len(sigs) - buy_n
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Total Signals", len(sigs))
-        m2.metric("🟢 BUY",  buy_n)
-        m3.metric("🔴 SELL", sell_n)
-
-        rows = []
-        for rank, s in enumerate(sigs, 1):
-            rows.append({
-                "Rank":        rank,
-                "Symbol":      s["symbol"],
-                "Signal":      s["signal"],
-                "EMA 6":       s["ema6"],
-                "EMA 30":      s["ema30"],
-                "Cross Price": s["cross_price"],
-                "Cross Time":  _format_cross_time(s["cross_time"]),
-                "Timeframe":   s["timeframe"],
-                "Age":         _format_age(s["cross_time"]),
-            })
-
-        df = pd.DataFrame(rows)
-
-        # Conditional row colouring
-        def _row_colour(row):
-            if row["Signal"] == "BUY":
-                bg = "background-color: rgba(0, 200, 83, 0.12)"
-            else:
-                bg = "background-color: rgba(255, 82, 82, 0.12)"
-            return [bg] * len(row)
-
-        styled = df.style.apply(_row_colour, axis=1)
-
-        st.dataframe(
-            styled,
-            use_container_width=True,
-            hide_index=True,
-            height=min(len(rows) * 40 + 50, 700),
-            column_config={
-                "EMA 6":       st.column_config.NumberColumn(format="%.2f"),
-                "EMA 30":      st.column_config.NumberColumn(format="%.2f"),
-                "Cross Price": st.column_config.NumberColumn(format="%.2f"),
-            },
+    if exit_note:
+        st.session_state.trade_log.append(
+            dict(
+                symbol=st.session_state.selected_symbol, direction=trade["direction"],
+                entry=trade["entry"], sl=trade["sl"], target=trade["target"],
+                result=exit_note[0], exit_price=exit_note[1],
+                entry_time=trade["entry_time"], exit_time=str(last_row["timestamp"]),
+            )
         )
+        st.session_state.active_trade = None
 
-    # ── Auto-refresh while running ──────────────────────────────
-    if _get("running"):
-        time.sleep(REFRESH_S)
-        st.rerun()
+# ============================================================================
+# SIGNAL PANEL
+# ============================================================================
+st.subheader("🎯 Current Signal")
 
+if st.session_state.active_trade:
+    t = st.session_state.active_trade
+    badge = "🟢 IN TRADE — BUY" if t["direction"] == "BUY" else "🔴 IN TRADE — SELL"
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Status", badge)
+    c2.metric("Entry", f"{t['entry']:.2f}")
+    c3.metric("Stop Loss", f"{t['sl']:.2f}")
+    c4.metric("Target", f"{t['target']:.2f}")
+    live_pl = (last_row["close"] - t["entry"]) if t["direction"] == "BUY" else (t["entry"] - last_row["close"])
+    st.caption(f"Entered at {t['entry_time']} • Live unrealized: {live_pl:+.2f} pts (last close {last_row['close']:.2f})")
+    st.info("Position is OPEN. This app will alert you here the moment SL or Target is hit on a completed candle. Manage/exit manually via your broker.")
+elif exit_note:
+    st.success(f"✅ {exit_note[0]} at {exit_note[1]:.2f} — trade closed. See log below. Watching for the next setup...")
+else:
+    if res["signal"] in ("BUY", "SELL"):
+        color = "🟢 BUY" if res["signal"] == "BUY" else "🔴 SELL"
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Signal", color)
+        c2.metric("Entry", f"{res['entry']:.2f}")
+        c3.metric("Stop Loss", f"{res['sl']:.2f}")
+        c4.metric("Target", f"{res['target']:.2f}")
+        rr = abs(res["target"] - res["entry"]) / max(abs(res["entry"] - res["sl"]), 0.01)
+        st.caption(f"Risk:Reward ≈ 1:{rr:.2f}")
+        st.success(f"**ENTER now** — {res['reason']}")
+    else:
+        st.warning(f"⏳ **WAIT** — {res['reason']}")
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  ENTRY POINT
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+st.caption(f"Market structure trend (from swings): **{res['trend'] or 'undetermined'}**  •  Last completed candle: {last_row['timestamp']}")
 
-if __name__ == "__main__":
-    main()
+# ============================================================================
+# CHART
+# ============================================================================
+st.plotly_chart(build_chart(res, st.session_state.selected_symbol, tf_minutes), use_container_width=True)
+
+# ============================================================================
+# DETECTED EVENTS
+# ============================================================================
+with st.expander("🔍 Detected structure events (recent)"):
+    ev_df = pd.DataFrame(res["events"][-15:])
+    if len(ev_df):
+        st.dataframe(ev_df[["timestamp", "type", "direction", "price"]], use_container_width=True, hide_index=True)
+    else:
+        st.write("No BOS/CHoCH events yet.")
+
+with st.expander("💧 Liquidity sweeps (recent)"):
+    sw_df = pd.DataFrame(res["sweeps"][-10:])
+    if len(sw_df):
+        st.dataframe(sw_df[["timestamp", "type", "level", "direction"]], use_container_width=True, hide_index=True)
+    else:
+        st.write("No liquidity sweeps detected recently.")
+
+with st.expander("📦 Order Blocks & Fair Value Gaps (recent)"):
+    ob_df = pd.DataFrame(res["obs"][-10:])
+    fv_df = pd.DataFrame(res["fvgs"][-10:])
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        st.markdown("**Order Blocks**")
+        st.dataframe(ob_df[["timestamp", "type", "top", "bottom"]] if len(ob_df) else pd.DataFrame(), use_container_width=True, hide_index=True)
+    with cc2:
+        st.markdown("**Fair Value Gaps**")
+        st.dataframe(fv_df[["timestamp", "type", "top", "bottom"]] if len(fv_df) else pd.DataFrame(), use_container_width=True, hide_index=True)
+
+# ============================================================================
+# TRADE LOG
+# ============================================================================
+st.subheader("📒 Signal / Trade Log")
+if st.session_state.trade_log:
+    st.dataframe(pd.DataFrame(st.session_state.trade_log), use_container_width=True, hide_index=True)
+else:
+    st.caption("No closed setups yet this session.")
