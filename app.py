@@ -1,712 +1,569 @@
-"""
-SMC Intraday Signal Assistant — Upstox Edition
-================================================
-A single-file Streamlit app that:
-  - Lets you type in an NSE stock name/symbol
-  - Pulls live + historical intraday candles from the Upstox API
-  - Runs a rule-based Smart Money Concepts (SMC) engine on CLOSED candles only
-    (Break of Structure, Change of Character, Liquidity Sweeps, Order Blocks,
-    Fair Value Gaps, Displacement)
-  - Shows a clear BUY / SELL / WAIT signal with Entry, Stop Loss and Target
-  - Tracks an active "paper" setup and tells you when to EXIT (SL/Target hit)
-  - NEVER places any order. This is a decision-support tool only.
-
---------------------------------------------------------------------------
-HOW TO RUN
---------------------------------------------------------------------------
-1) pip install streamlit pandas numpy requests plotly pytz streamlit-autorefresh
-2) streamlit run smc_upstox_app.py
-3) In the sidebar, paste a valid Upstox API v2 access token
-   (generate it via Upstox's OAuth login flow — this app does not do the
-   OAuth dance for you, since that requires a redirect/callback server).
-4) Type a stock name (e.g. "RELIANCE", "TCS", "HDFC BANK"), pick it from the
-   matches, choose a timeframe, and click "Start Monitoring".
-
---------------------------------------------------------------------------
-IMPORTANT NOTES / LIMITATIONS (read before using with real money)
---------------------------------------------------------------------------
-- This is EDUCATIONAL / DECISION-SUPPORT software. It does not place, modify
-  or cancel any order. Every trade decision and execution is yours.
-- SMC concepts (BOS, CHoCH, OB, FVG, liquidity sweeps, displacement) are
-  discretionary in nature. This engine encodes one reasonable, rule-based
-  interpretation of them — not "the" definitive definition. Validate the
-  chart yourself before acting on any signal.
-- The engine only acts on fully CLOSED candles. The most recent, still-forming
-  candle of your chosen timeframe is always dropped before analysis, so
-  nothing here "repaints" using an incomplete bar.
-- Upstox's exact REST endpoint paths/params can change between API versions.
-  This file targets the Upstox API v2 conventions. If your account is on a
-  different API version, adjust `UPSTOX_BASE` and the two fetch functions.
-- Historical intraday 1-minute data availability is limited by Upstox
-  (typically the current + a few recent trading days). We fetch 1-minute
-  data and resample it locally into your chosen timeframe (3/5/15 min) so
-  we aren't dependent on Upstox supporting every timeframe natively.
-"""
-
-import time
-from datetime import datetime, timedelta, time as dtime
-
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
-import pytz
-import requests
 import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-try:
-    from streamlit_autorefresh import st_autorefresh
-    HAS_AUTOREFRESH = True
-except Exception:
-    HAS_AUTOREFRESH = False
+from config import settings
+from utils import (
+    get_ist_now,
+    format_ist_time,
+    is_nse_market_open,
+    mask_token,
+    format_currency,
+    format_pct
+)
+from upstox_client import upstox_client
+from market_data import prepare_market_data, MarketDataUnavailableError
+from indicators import compute_indicators
+from smc_engine import smc_engine
+from signal_engine import signal_engine
+from risk_engine import risk_engine
+from target_engine import target_engine
+from telegram import telegram_notifier
 
-# ============================================================================
-# CONSTANTS
-# ============================================================================
-IST = pytz.timezone("Asia/Kolkata")
-MARKET_OPEN = dtime(9, 15)
-MARKET_CLOSE = dtime(15, 30)
-UPSTOX_BASE = "https://api.upstox.com/v2"
-INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz"
+# ==============================================================================
+# PAGE CONFIGURATION & STYLING
+# ==============================================================================
+st.set_page_config(
+    page_title="NSE Semi-Algo — Trading Analyzer",
+    page_icon="📈",
+    layout="centered",
+    initial_sidebar_state="collapsed"
+)
 
-st.set_page_config(page_title="SMC Intraday Signal Assistant", layout="wide")
+# Custom Premium Dark Theme CSS
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
+    
+    html, body, [class*="css"] {
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    
+    .stApp {
+        background-color: #0b0f19;
+        color: #e2e8f0;
+    }
+    
+    /* Header Container */
+    .hero-header {
+        text-align: center;
+        padding: 1.2rem 0 1.5rem 0;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        margin-bottom: 1.5rem;
+    }
+    .hero-title {
+        font-size: 2.1rem;
+        font-weight: 800;
+        letter-spacing: -0.02em;
+        background: linear-gradient(135deg, #38bdf8 0%, #818cf8 50%, #c084fc 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 0.3rem;
+    }
+    .hero-subtitle {
+        font-size: 0.95rem;
+        color: #94a3b8;
+        font-weight: 500;
+    }
+    
+    /* Status Badges */
+    .badge-open {
+        display: inline-block;
+        padding: 0.25rem 0.75rem;
+        border-radius: 9999px;
+        background: rgba(16, 185, 129, 0.15);
+        color: #34d399;
+        border: 1px solid rgba(52, 211, 153, 0.3);
+        font-size: 0.8rem;
+        font-weight: 600;
+    }
+    .badge-closed {
+        display: inline-block;
+        padding: 0.25rem 0.75rem;
+        border-radius: 9999px;
+        background: rgba(239, 68, 68, 0.15);
+        color: #f87171;
+        border: 1px solid rgba(248, 113, 113, 0.3);
+        font-size: 0.8rem;
+        font-weight: 600;
+    }
+    
+    /* Card Containers */
+    .glass-card {
+        background: rgba(17, 24, 39, 0.75);
+        backdrop-filter: blur(12px);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 14px;
+        padding: 1.25rem 1.5rem;
+        margin-bottom: 1.2rem;
+        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+    }
+    
+    /* Main Directional Signal Card */
+    .signal-card-buy {
+        background: radial-gradient(circle at 50% 0%, rgba(16, 185, 129, 0.25) 0%, rgba(15, 23, 42, 0.85) 75%);
+        border: 2px solid #10b981;
+        border-radius: 16px;
+        padding: 1.8rem;
+        text-align: center;
+        box-shadow: 0 0 35px rgba(16, 185, 129, 0.25);
+        margin: 1.2rem 0;
+    }
+    .signal-card-sell {
+        background: radial-gradient(circle at 50% 0%, rgba(239, 68, 68, 0.25) 0%, rgba(15, 23, 42, 0.85) 75%);
+        border: 2px solid #ef4444;
+        border-radius: 16px;
+        padding: 1.8rem;
+        text-align: center;
+        box-shadow: 0 0 35px rgba(239, 68, 68, 0.25);
+        margin: 1.2rem 0;
+    }
+    
+    .signal-text-buy {
+        font-size: 3.2rem;
+        font-weight: 900;
+        letter-spacing: 0.05em;
+        color: #10b981;
+        text-shadow: 0 0 20px rgba(16, 185, 129, 0.5);
+        margin: 0.4rem 0;
+    }
+    .signal-text-sell {
+        font-size: 3.2rem;
+        font-weight: 900;
+        letter-spacing: 0.05em;
+        color: #ef4444;
+        text-shadow: 0 0 20px rgba(239, 68, 68, 0.5);
+        margin: 0.4rem 0;
+    }
+    
+    .stat-label {
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #94a3b8;
+        font-weight: 600;
+    }
+    .stat-val {
+        font-size: 1.4rem;
+        font-weight: 700;
+        color: #f8fafc;
+        font-family: 'JetBrains Mono', monospace;
+    }
+    .stat-val-highlight {
+        font-size: 1.55rem;
+        font-weight: 800;
+        font-family: 'JetBrains Mono', monospace;
+    }
+    
+    /* Disclaimer Note */
+    .disclaimer-text {
+        font-size: 0.75rem;
+        color: #64748b;
+        text-align: center;
+        margin-top: 0.8rem;
+        font-style: italic;
+    }
+</style>
+""", unsafe_allow_html=True)
 
+# Initialize Session State
+if "upstox_token" not in st.session_state:
+    st.session_state["upstox_token"] = ""
+if "is_connected" not in st.session_state:
+    st.session_state["is_connected"] = False
+if "user_name" not in st.session_state:
+    st.session_state["user_name"] = ""
+if "current_symbol" not in st.session_state:
+    st.session_state["current_symbol"] = "SAIL"
+if "analysis_result" not in st.session_state:
+    st.session_state["analysis_result"] = None
 
-# ============================================================================
-# TIME / MARKET HOURS HELPERS
-# ============================================================================
-def now_ist():
-    return datetime.now(IST).replace(tzinfo=None)
+# Header Banner
+st.markdown("""
+<div class="hero-header">
+    <div class="hero-title">⚡ NSE SEMI-ALGO</div>
+    <div class="hero-subtitle">Simple Streamlit Trading Analyzer • Upstox API v2</div>
+</div>
+""", unsafe_allow_html=True)
 
+# Market Hours Live Badge
+is_open, market_status_text = is_nse_market_open()
+now_str = format_ist_time()
+badge_class = "badge-open" if is_open else "badge-closed"
 
-def is_market_open():
-    n = now_ist()
-    if n.weekday() >= 5:
-        return False
-    return MARKET_OPEN <= n.time() <= MARKET_CLOSE
+st.markdown(f"""
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.2rem; padding: 0 0.5rem;">
+    <span class="{badge_class}">{market_status_text}</span>
+    <span style="font-size: 0.85rem; color: #94a3b8; font-family: 'JetBrains Mono', monospace;">Time: {now_str}</span>
+</div>
+""", unsafe_allow_html=True)
 
+# ==============================================================================
+# SECTION 1: UPSTOX API CONNECTION
+# ==============================================================================
+with st.container():
+    st.markdown("### 🔑 UPSTOX API CONNECTION")
 
-def market_status_label():
-    if not is_market_open():
-        n = now_ist()
-        if n.weekday() >= 5:
-            return "🔴 CLOSED (Weekend)"
-        if n.time() < MARKET_OPEN:
-            return "🟡 PRE-MARKET (opens 9:15 AM)"
-        return "🔴 CLOSED (market ended 3:30 PM)"
-    return "🟢 OPEN"
-
-
-# ============================================================================
-# INSTRUMENT MASTER (symbol -> Upstox instrument_key)
-# ============================================================================
-@st.cache_data(ttl=24 * 3600, show_spinner="Loading NSE instrument list...")
-def load_instruments():
-    df = pd.read_csv(INSTRUMENTS_URL)
-    df = df[df["instrument_type"] == "EQ"]
-    df = df[["instrument_key", "tradingsymbol", "name"]].dropna()
-    return df.reset_index(drop=True)
-
-
-def search_instrument(df, query):
-    q = query.strip().upper()
-    if not q:
-        return pd.DataFrame()
-    mask = df["tradingsymbol"].str.upper().str.contains(q, na=False) | df["name"].str.upper().str.contains(
-        q, na=False
-    )
-    return df[mask].head(25)
-
-
-# ============================================================================
-# DATA FETCH (Upstox v2) — historical + intraday, merged and resampled
-# ============================================================================
-def api_headers(token):
-    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-
-
-def candles_to_df(candles):
-    cols = ["timestamp", "open", "high", "low", "close", "volume", "oi"]
-    if not candles:
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df = pd.DataFrame(candles, columns=cols)
-    ts = pd.to_datetime(df["timestamp"])
-    if getattr(ts.dt, "tz", None) is not None:
-        ts = ts.dt.tz_convert(IST).dt.tz_localize(None)
-    df["timestamp"] = ts
-    df = df.sort_values("timestamp").reset_index(drop=True)
-    return df[["timestamp", "open", "high", "low", "close", "volume"]]
-
-
-@st.cache_data(ttl=20, show_spinner=False)
-def fetch_intraday_1m(instrument_key, token):
-    url = f"{UPSTOX_BASE}/historical-candle/intraday/{instrument_key}/1minute"
-    r = requests.get(url, headers=api_headers(token), timeout=10)
-    r.raise_for_status()
-    candles = r.json().get("data", {}).get("candles", [])
-    return candles_to_df(candles)
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_historical_1m(instrument_key, token, from_date, to_date):
-    url = f"{UPSTOX_BASE}/historical-candle/{instrument_key}/1minute/{to_date}/{from_date}"
-    r = requests.get(url, headers=api_headers(token), timeout=10)
-    r.raise_for_status()
-    candles = r.json().get("data", {}).get("candles", [])
-    return candles_to_df(candles)
-
-
-def resample(df, tf_minutes):
-    d = df.set_index("timestamp")
-    o = d.resample(f"{tf_minutes}min", label="left", closed="left").agg(
-        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    )
-    o = o.dropna(subset=["open", "high", "low", "close"])
-    return o.reset_index()
-
-
-def get_completed_candles(instrument_key, token, tf_minutes):
-    """Fetch 1-min data, resample to tf_minutes, and DROP the still-forming
-    last candle so the engine never looks at an incomplete bar."""
-    today = now_ist().strftime("%Y-%m-%d")
-    from_date = (now_ist() - timedelta(days=6)).strftime("%Y-%m-%d")
-
-    hist = pd.DataFrame()
-    intraday = pd.DataFrame()
-    err = None
-    try:
-        hist = fetch_historical_1m(instrument_key, token, from_date, today)
-    except Exception as e:
-        err = str(e)
-    try:
-        intraday = fetch_intraday_1m(instrument_key, token)
-    except Exception as e:
-        err = str(e)
-
-    df = pd.concat([hist, intraday], ignore_index=True)
-    if df.empty:
-        return df, err
-    df = df.drop_duplicates(subset="timestamp").sort_values("timestamp").reset_index(drop=True)
-
-    df = resample(df, tf_minutes)
-    if df.empty:
-        return df, err
-
-    n = now_ist()
-    last_start = df.iloc[-1]["timestamp"]
-    if last_start + timedelta(minutes=tf_minutes) > n:
-        df = df.iloc[:-1]  # drop forming candle -> no look-ahead / no repaint
-
-    return df.reset_index(drop=True), err
-
-
-# ============================================================================
-# SMC ANALYSIS ENGINE
-# ============================================================================
-def find_swings(df, left=2, right=2):
-    """Fractal swing highs/lows using a symmetric lookback window."""
-    highs = df["high"].values
-    lows = df["low"].values
-    n = len(df)
-    sh = [False] * n
-    sl = [False] * n
-    for i in range(left, n - right):
-        wh = highs[i - left : i + right + 1]
-        wl = lows[i - left : i + right + 1]
-        if highs[i] == wh.max() and list(wh).count(highs[i]) == 1:
-            sh[i] = True
-        if lows[i] == wl.min() and list(wl).count(lows[i]) == 1:
-            sl[i] = True
-    out = df.copy()
-    out["swing_high"] = sh
-    out["swing_low"] = sl
-    return out
-
-
-def market_structure(df):
-    """Walk candles chronologically; whenever a close breaks the most recent
-    confirmed swing high/low, log a BOS (trend continuation) or CHoCH (trend
-    reversal) event. Each swing level can only trigger one event (no dupes)."""
-    events = []
-    swing_highs = df[df["swing_high"]][["high"]].copy()
-    swing_lows = df[df["swing_low"]][["low"]].copy()
-
-    trend = None
-    broken_sh, broken_sl = set(), set()
-
-    for i in range(len(df)):
-        close = df["close"].iloc[i]
-        ts = df["timestamp"].iloc[i]
-
-        sh_before = swing_highs[swing_highs.index < i]
-        sl_before = swing_lows[swing_lows.index < i]
-        cur_sh = sh_before["high"].iloc[-1] if len(sh_before) else None
-        cur_sl = sl_before["low"].iloc[-1] if len(sl_before) else None
-
-        if cur_sh is not None and close > cur_sh and cur_sh not in broken_sh:
-            etype = "BOS" if trend in (None, "up") else "CHoCH"
-            events.append(dict(idx=i, timestamp=ts, type=etype, direction="bull", price=cur_sh))
-            trend = "up"
-            broken_sh.add(cur_sh)
-        if cur_sl is not None and close < cur_sl and cur_sl not in broken_sl:
-            etype = "BOS" if trend in (None, "down") else "CHoCH"
-            events.append(dict(idx=i, timestamp=ts, type=etype, direction="bear", price=cur_sl))
-            trend = "down"
-            broken_sl.add(cur_sl)
-
-    return events, trend
-
-
-def detect_liquidity_sweeps(df, lookback=20):
-    """A sweep = price wicks beyond a recent swing extreme but CLOSES back
-    inside it -> stop-hunt / liquidity grab, often precedes a reversal."""
-    sweeps = []
-    for i in range(lookback, len(df)):
-        window = df.iloc[i - lookback : i]
-        recent_high = window.loc[window["swing_high"], "high"].max() if window["swing_high"].any() else None
-        recent_low = window.loc[window["swing_low"], "low"].min() if window["swing_low"].any() else None
-        row = df.iloc[i]
-        if recent_high is not None and row["high"] > recent_high and row["close"] < recent_high:
-            sweeps.append(
-                dict(idx=i, timestamp=row["timestamp"], type="sell_side_sweep", level=float(recent_high), direction="bullish")
+    if not st.session_state["is_connected"]:
+        # Connection Form
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            token_input = st.text_input(
+                "Upstox Access Token",
+                type="password",
+                placeholder="Paste Upstox Access Token here (e.g. eyJhbGci...)",
+                help="Never displayed or logged. Kept securely in current session.",
+                label_visibility="collapsed"
             )
-        if recent_low is not None and row["low"] < recent_low and row["close"] > recent_low:
-            sweeps.append(
-                dict(idx=i, timestamp=row["timestamp"], type="buy_side_sweep", level=float(recent_low), direction="bearish")
-            )
-    return sweeps
+        with col2:
+            connect_btn = st.button("CONNECT", use_container_width=True, type="primary")
 
+        if connect_btn:
+            if not token_input.strip():
+                st.error("🔴 Please enter your Upstox Access Token.")
+            else:
+                with st.spinner("Validating with Upstox API..."):
+                    val_res = upstox_client.validate_token(token_input)
+                    if val_res.get("valid"):
+                        st.session_state["upstox_token"] = token_input.strip()
+                        st.session_state["is_connected"] = True
+                        st.session_state["user_name"] = val_res.get("user_name", "Trader")
+                        upstox_client.set_token(token_input.strip())
+                        st.rerun()
+                    else:
+                        st.error(f"🔴 **CONNECTION FAILED**: {val_res.get('message', 'Invalid Access Token')}")
+    else:
+        # Connected State
+        c_status, c_disconnect = st.columns([3, 1])
+        with c_status:
+            masked = mask_token(st.session_state["upstox_token"])
+            st.success(f"🟢 **UPSTOX CONNECTED** — Welcome, **{st.session_state['user_name']}** (`{masked}`)")
+        with c_disconnect:
+            if st.button("DISCONNECT", use_container_width=True):
+                st.session_state["upstox_token"] = ""
+                st.session_state["is_connected"] = False
+                st.session_state["analysis_result"] = None
+                upstox_client.set_token("")
+                st.rerun()
 
-def detect_fvg(df):
-    """3-candle Fair Value Gap / imbalance."""
-    fvgs = []
-    for i in range(2, len(df)):
-        c1, c3 = df.iloc[i - 2], df.iloc[i]
-        if c1["high"] < c3["low"]:
-            fvgs.append(dict(idx=i, timestamp=df.iloc[i - 1]["timestamp"], type="bullish_fvg", top=float(c3["low"]), bottom=float(c1["high"])))
-        if c1["low"] > c3["high"]:
-            fvgs.append(dict(idx=i, timestamp=df.iloc[i - 1]["timestamp"], type="bearish_fvg", top=float(c1["low"]), bottom=float(c3["high"])))
-    return fvgs
+# Halt execution until connected
+if not st.session_state["is_connected"]:
+    st.info("👆 Please enter your Upstox Access Token above and click **CONNECT** to proceed to stock analysis.")
+    st.stop()
 
+st.divider()
 
-def detect_displacement(df, atr_period=14, mult=1.5):
-    """Momentum candle: body notably larger than recent average range."""
-    body = (df["close"] - df["open"]).abs()
-    rng = df["high"] - df["low"]
-    atr = rng.rolling(atr_period, min_periods=5).mean()
-    return body > (atr * mult)
+# ==============================================================================
+# SECTION 2: STOCK INPUT & ANALYSIS TRIGGER
+# ==============================================================================
+st.markdown("### 🔍 STOCK ANALYSIS")
 
+col_sym, col_tf, col_btn = st.columns([3, 1.5, 1.5])
 
-def detect_order_blocks(df, events, disp_series):
-    """For each structural break, find the last opposite-colour candle right
-    before the displacement leg that caused it -> that candle is the OB."""
-    obs = []
-    for ev in events:
-        i, direction = ev["idx"], ev["direction"]
-        start = max(0, i - 10)
-        found = None
-        for j in range(i, start, -1):
-            if j < len(disp_series) and bool(disp_series.iloc[j]):
-                k = j - 1
-                if k >= 0:
-                    o, c = df["open"].iloc[k], df["close"].iloc[k]
-                    if direction == "bull" and c < o:
-                        found = k
-                    elif direction == "bear" and c > o:
-                        found = k
-                break
-        if found is not None:
-            row = df.iloc[found]
-            obs.append(
-                dict(
-                    idx=found,
-                    timestamp=row["timestamp"],
-                    type="bullish_ob" if direction == "bull" else "bearish_ob",
-                    top=float(row["high"]),
-                    bottom=float(row["low"]),
-                    event_idx=i,
-                )
-            )
-    return obs
+with col_sym:
+    sym_input = st.text_input(
+        "Enter NSE Stock",
+        value=st.session_state["current_symbol"],
+        placeholder="e.g. SAIL, RELIANCE, TCS, INFY, SBIN",
+        help="Type any NSE equity symbol. Instrument key is resolved automatically.",
+        label_visibility="collapsed"
+    ).upper().strip()
 
-
-def generate_signal(df):
-    """Combine sweep -> CHoCH/BOS confirmation -> OB/FVG retracement zone
-    -> confirmation candle, into a single actionable BUY/SELL/WAIT signal."""
-    df = find_swings(df)
-    events, trend = market_structure(df)
-    sweeps = detect_liquidity_sweeps(df)
-    fvgs = detect_fvg(df)
-    disp = detect_displacement(df)
-    obs = detect_order_blocks(df, events, disp)
-
-    result = dict(
-        signal="WAIT", reason="", entry=None, sl=None, target=None, trend=trend,
-        events=events, sweeps=sweeps, fvgs=fvgs, obs=obs, disp=disp, df=df,
+with col_tf:
+    timeframe = st.selectbox(
+        "Timeframe",
+        options=["1m", "3m", "5m", "15m", "30m", "1h"],
+        index=2,  # Default 5m
+        label_visibility="collapsed"
     )
 
-    if len(df) < 30:
-        result["reason"] = "Collecting data — need more completed candles before analysis is reliable."
-        return result
+with col_btn:
+    analyze_btn = st.button("ANALYZE STOCK", type="primary", use_container_width=True)
 
-    last_price = float(df["close"].iloc[-1])
-    last_idx = len(df) - 1
-    lookback_bars = 15
-
-    recent_sweeps = [s for s in sweeps if s["idx"] >= last_idx - lookback_bars]
-
-    bullish_setup = None
-    bearish_setup = None
-    for sw in recent_sweeps:
-        if sw["direction"] == "bullish":
-            confirm = [e for e in events if e["idx"] > sw["idx"] and e["direction"] == "bull"]
-            if confirm:
-                bullish_setup = (sw, confirm[0])
-        if sw["direction"] == "bearish":
-            confirm = [e for e in events if e["idx"] > sw["idx"] and e["direction"] == "bear"]
-            if confirm:
-                bearish_setup = (sw, confirm[0])
-
-    def nearest_zone(after_idx, direction):
-        pool = obs + fvgs
-        cands = [
-            z for z in pool
-            if z["idx"] >= after_idx
-            and (("bullish" in z["type"]) if direction == "bull" else ("bearish" in z["type"]))
-        ]
-        if not cands:
-            return None
-        cands.sort(key=lambda z: abs(last_price - (z["top"] + z["bottom"]) / 2))
-        return cands[0]
-
-    if bullish_setup:
-        sw, choch = bullish_setup
-        zone = nearest_zone(choch["idx"], "bull")
-        if zone:
-            top, bottom = zone["top"], zone["bottom"]
-            in_zone = bottom <= last_price <= top * 1.002
-            confirm_candle = df["close"].iloc[-1] > df["open"].iloc[-1]
-            if in_zone and confirm_candle:
-                entry = last_price
-                sl = min(sw["level"], bottom) * 0.999
-                risk = max(entry - sl, 0.01)
-                future_highs = df.loc[df["swing_high"], "high"]
-                targets = future_highs[future_highs > entry]
-                target = float(targets.min()) if len(targets) else entry + risk * 2
-                result.update(
-                    signal="BUY",
-                    reason=(
-                        f"Buy-side liquidity swept at {sw['level']:.2f}, followed by a bullish "
-                        f"{choch['type']}. Price reacted from a {zone['type'].replace('_', ' ')} zone "
-                        f"({bottom:.2f}–{top:.2f}) with a bullish confirmation candle."
-                    ),
-                    entry=round(entry, 2), sl=round(sl, 2), target=round(target, 2),
-                )
-                return result
-            result["reason"] = (
-                f"Bullish sweep + {choch['type']} confirmed. Waiting for price to tap into "
-                f"{zone['type'].replace('_', ' ')} zone ({bottom:.2f}–{top:.2f}) with a bullish close."
+if analyze_btn and sym_input:
+    st.session_state["current_symbol"] = sym_input
+    with st.spinner(f"Fetching market data and running SMC + Technical analysis for {sym_input}..."):
+        try:
+            # 1. Fetch live market quote
+            quote = upstox_client.get_market_quote(sym_input)
+            
+            # 2. Fetch completed candle data
+            raw_candles = upstox_client.fetch_candles(sym_input, timeframe=timeframe)
+            
+            # 3. Clean & validate market data
+            pkg = prepare_market_data(sym_input, quote, raw_candles, timeframe=timeframe)
+            
+            # 4. Compute Indicators & Price Action
+            df_ind, ind_snap = compute_indicators(pkg.candles)
+            
+            # 5. Compute Smart Money Concepts (SMC)
+            smc_snap = smc_engine.analyze(df_ind, pdh=quote.get("pdh"), pdl=quote.get("pdl"))
+            
+            # 6. Confluence Decision Engine (Strict BUY or SELL)
+            signal_res = signal_engine.evaluate(
+                symbol=sym_input,
+                current_price=quote["last_price"],
+                indicators=ind_snap,
+                smc=smc_snap
             )
-        else:
-            result["reason"] = "Bullish sweep + CHoCH detected, but no clear OB/FVG retracement zone yet."
-
-    if bearish_setup and result["signal"] == "WAIT":
-        sw, choch = bearish_setup
-        zone = nearest_zone(choch["idx"], "bear")
-        if zone:
-            top, bottom = zone["top"], zone["bottom"]
-            in_zone = bottom * 0.998 <= last_price <= top
-            confirm_candle = df["close"].iloc[-1] < df["open"].iloc[-1]
-            if in_zone and confirm_candle:
-                entry = last_price
-                sl = max(sw["level"], top) * 1.001
-                risk = max(sl - entry, 0.01)
-                future_lows = df.loc[df["swing_low"], "low"]
-                targets = future_lows[future_lows < entry]
-                target = float(targets.max()) if len(targets) else entry - risk * 2
-                result.update(
-                    signal="SELL",
-                    reason=(
-                        f"Sell-side liquidity swept at {sw['level']:.2f}, followed by a bearish "
-                        f"{choch['type']}. Price reacted from a {zone['type'].replace('_', ' ')} zone "
-                        f"({bottom:.2f}–{top:.2f}) with a bearish confirmation candle."
-                    ),
-                    entry=round(entry, 2), sl=round(sl, 2), target=round(target, 2),
-                )
-                return result
-            result["reason"] = (
-                f"Bearish sweep + {choch['type']} confirmed. Waiting for price to tap into "
-                f"{zone['type'].replace('_', ' ')} zone ({bottom:.2f}–{top:.2f}) with a bearish close."
+            
+            # 7. Maximum Target Engine
+            target_res = target_engine.calculate_target(
+                direction=signal_res.direction,
+                entry_price=signal_res.entry_price,
+                indicators=ind_snap,
+                smc=smc_snap
             )
-        else:
-            result["reason"] = "Bearish sweep + CHoCH detected, but no clear OB/FVG retracement zone yet."
+            
+            # 8. Dynamic Stop Loss & Risk Engine
+            risk_res = risk_engine.calculate_stop_loss(
+                direction=signal_res.direction,
+                entry_price=signal_res.entry_price,
+                indicators=ind_snap,
+                smc=smc_snap,
+                target_price=target_res.target_price
+            )
+            
+            # Save into session state
+            st.session_state["analysis_result"] = {
+                "symbol": sym_input,
+                "timeframe": timeframe,
+                "quote": quote,
+                "pkg": pkg,
+                "indicators": ind_snap,
+                "smc": smc_snap,
+                "signal": signal_res,
+                "target": target_res,
+                "risk": risk_res,
+                "df": df_ind
+            }
+            
+            # Optional Telegram alert if configured
+            if telegram_notifier.is_configured():
+                telegram_notifier.send_signal_alert(
+                    symbol=sym_input,
+                    direction=signal_res.direction,
+                    current_price=quote["last_price"],
+                    entry=signal_res.entry_price,
+                    target=target_res.target_price,
+                    stop_loss=risk_res.stop_loss,
+                    rr_ratio=risk_res.risk_reward_ratio
+                )
 
-    if result["signal"] == "WAIT" and not result["reason"]:
-        result["reason"] = "No high-probability SMC setup right now (no recent sweep+structure-shift combo). Monitoring..."
+        except MarketDataUnavailableError as mde:
+            st.error(f"🔴 **Market data unavailable — please try again.** ({str(mde)})")
+            st.session_state["analysis_result"] = None
+        except Exception as e:
+            st.error(f"🔴 **Market data unavailable — please try again.** (Error: {str(e)})")
+            st.session_state["analysis_result"] = None
 
-    return result
+# ==============================================================================
+# SECTION 3: DISPLAY ANALYSIS RESULTS
+# ==============================================================================
+res = st.session_state.get("analysis_result")
 
-
-# ============================================================================
-# CHART
-# ============================================================================
-def build_chart(res, symbol, tf_minutes):
+if res:
+    sym = res["symbol"]
+    q = res["quote"]
+    sig = res["signal"]
+    tgt = res["target"]
+    rsk = res["risk"]
     df = res["df"]
-    fig = go.Figure()
+    
+    current_p = q["last_price"]
+    prev_c = q["prev_close"]
+    chg = q["change"]
+    chg_p = q["change_pct"]
+    
+    # -------------------------------------------------------------
+    # 3.1 STOCK CURRENT INFORMATION BAR
+    # -------------------------------------------------------------
+    st.markdown(f"## {sym}")
+    
+    # Current Price & Intraday Metrics Bar
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    with m1:
+        st.metric("CURRENT PRICE", format_currency(current_p), f"{chg_p:+.2f}%")
+    with m2:
+        st.metric("PREV CLOSE", format_currency(prev_c))
+    with m3:
+        st.metric("DAY HIGH", format_currency(q["high"]))
+    with m4:
+        st.metric("DAY LOW", format_currency(q["low"]))
+    with m5:
+        st.metric("VOLUME", f"{q['volume']:,}")
+    with m6:
+        st.metric("VWAP", format_currency(q["vwap"]))
+
+    # -------------------------------------------------------------
+    # 3.2 MAIN OUTPUT — ONLY BUY OR SELL (THE PRIMARY FOCUS)
+    # -------------------------------------------------------------
+    is_buy = sig.direction == "BUY"
+    card_class = "signal-card-buy" if is_buy else "signal-card-sell"
+    sig_text_class = "signal-text-buy" if is_buy else "signal-text-sell"
+    emoji = "🟢" if is_buy else "🔴"
+    target_color = "#10b981" if is_buy else "#f87171"
+    sl_color = "#ef4444" if is_buy else "#34d399"
+    
+    st.markdown(f"""
+    <div class="{card_class}">
+        <div style="font-size: 1.1rem; letter-spacing: 0.12em; color: #94a3b8; font-weight: 700; text-transform: uppercase;">
+            {sym} • {res['timeframe'].upper()} TIMEFRAME
+        </div>
+        <div class="{sig_text_class}">
+            {emoji} {sig.direction}
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-top: 1.5rem; text-align: center; border-top: 1px solid rgba(255, 255, 255, 0.1); padding-top: 1.2rem;">
+            <div>
+                <div class="stat-label">Current Price</div>
+                <div class="stat-val">{format_currency(current_p)}</div>
+            </div>
+            <div>
+                <div class="stat-label">Entry Price</div>
+                <div class="stat-val">{format_currency(sig.entry_price)}</div>
+            </div>
+            <div>
+                <div class="stat-label">Maximum Target</div>
+                <div class="stat-val-highlight" style="color: {target_color};">{format_currency(tgt.target_price)}</div>
+                <div style="font-size: 0.8rem; color: {target_color}; font-weight: 600;">{tgt.target_distance_pct:+.1f}% move</div>
+            </div>
+            <div>
+                <div class="stat-label">Stop Loss</div>
+                <div class="stat-val-highlight" style="color: {sl_color};">{format_currency(rsk.stop_loss)}</div>
+                <div style="font-size: 0.8rem; color: #94a3b8; font-weight: 600;">-{rsk.risk_pct:.1f}% risk</div>
+            </div>
+        </div>
+        <div style="margin-top: 1rem; display: flex; justify-content: center; gap: 2.5rem; font-size: 0.95rem; color: #cbd5e1;">
+            <span>⚖️ <b>Risk/Reward:</b> 1 : {rsk.risk_reward_ratio:.1f}</span>
+            <span>🎯 <b>Target Reference:</b> {tgt.target_reference_name}</span>
+            <span>🛡️ <b>SL Invalidation:</b> {rsk.invalidation_level_name}</span>
+        </div>
+        <div class="disclaimer-text">
+            ⚠️ Technical analysis estimate — not guaranteed.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # -------------------------------------------------------------
+    # 3.3 INTERACTIVE CANDLESTICK CHART
+    # -------------------------------------------------------------
+    st.markdown("### 📊 TECHNICAL & SMC CHART")
+    
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.75, 0.25],
+        subplot_titles=("", "Volume")
+    )
+    
+    # 1. Candlesticks
     fig.add_trace(
         go.Candlestick(
-            x=df["timestamp"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-            name=symbol, increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-        )
+            x=df["timestamp"],
+            open=df["open"],
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            name="Candlesticks",
+            increasing_line_color="#10b981",
+            decreasing_line_color="#ef4444"
+        ),
+        row=1, col=1
     )
+    
+    # 2. EMAs (9, 21, 50)
+    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["ema_9"], line=dict(color="#38bdf8", width=1.3), name="EMA 9"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["ema_21"], line=dict(color="#f59e0b", width=1.3), name="EMA 21"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["ema_50"], line=dict(color="#a855f7", width=1.5), name="EMA 50"), row=1, col=1)
+    
+    # 3. VWAP
+    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["vwap"], line=dict(color="#ec4899", width=1.5, dash="dot"), name="VWAP"), row=1, col=1)
 
-    for ob in res["obs"]:
-        color = "rgba(38,166,154,0.20)" if "bullish" in ob["type"] else "rgba(239,83,80,0.20)"
-        fig.add_shape(
-            type="rect", x0=ob["timestamp"], x1=df["timestamp"].iloc[-1],
-            y0=ob["bottom"], y1=ob["top"], fillcolor=color, line=dict(width=0), layer="below",
-        )
+    # 4. Previous Day High & Low
+    if res["smc"].pdh > 0:
+        fig.add_trace(go.Scatter(x=df["timestamp"], y=[res["smc"].pdh]*len(df), line=dict(color="#4ade80", width=1.2, dash="dash"), name="PDH"), row=1, col=1)
+    if res["smc"].pdl > 0:
+        fig.add_trace(go.Scatter(x=df["timestamp"], y=[res["smc"].pdl]*len(df), line=dict(color="#f87171", width=1.2, dash="dash"), name="PDL"), row=1, col=1)
 
-    for fv in res["fvgs"][-15:]:
-        color = "rgba(41,98,255,0.15)" if "bullish" in fv["type"] else "rgba(255,152,0,0.15)"
-        fig.add_shape(
-            type="rect", x0=fv["timestamp"], x1=df["timestamp"].iloc[-1],
-            y0=fv["bottom"], y1=fv["top"], fillcolor=color, line=dict(width=0), layer="below",
-        )
+    # 5. Key Trade Levels: Entry, SL, Target
+    fig.add_hline(y=sig.entry_price, line=dict(color="#e2e8f0", width=1.5, dash="dash"), annotation_text=f"Entry: ₹{sig.entry_price:.2f}", annotation_position="top right", row=1, col=1)
+    fig.add_hline(y=tgt.target_price, line=dict(color="#10b981", width=2.0), annotation_text=f"Target: ₹{tgt.target_price:.2f}", annotation_position="top right", row=1, col=1)
+    fig.add_hline(y=rsk.stop_loss, line=dict(color="#ef4444", width=2.0), annotation_text=f"SL: ₹{rsk.stop_loss:.2f}", annotation_position="bottom right", row=1, col=1)
 
-    for sw in res["sweeps"][-10:]:
+    # 6. Volume Sub-plot
+    colors = ["#10b981" if c >= o else "#ef4444" for c, o in zip(df["close"], df["open"])]
+    fig.add_trace(
+        go.Bar(x=df["timestamp"], y=df["volume"], marker_color=colors, name="Volume"),
+        row=2, col=1
+    )
+    if "volume_ma" in df.columns:
         fig.add_trace(
-            go.Scatter(
-                x=[sw["timestamp"]], y=[sw["level"]], mode="markers",
-                marker=dict(symbol="x", size=10, color="#ffca28"),
-                name="Liquidity Sweep", showlegend=False,
-                hovertext=f"{sw['type']} @ {sw['level']:.2f}",
-            )
+            go.Scatter(x=df["timestamp"], y=df["volume_ma"], line=dict(color="#fbbf24", width=1.2), name="Vol 20-MA"),
+            row=2, col=1
         )
-
-    for ev in res["events"][-12:]:
-        color = "#26a69a" if ev["direction"] == "bull" else "#ef5350"
-        fig.add_annotation(
-            x=ev["timestamp"], y=ev["price"], text=ev["type"], showarrow=True, arrowhead=1,
-            arrowcolor=color, font=dict(color=color, size=10), yshift=15 if ev["direction"] == "bull" else -15,
-        )
-
-    if res["signal"] in ("BUY", "SELL") and res["entry"]:
-        fig.add_hline(y=res["entry"], line_dash="dot", line_color="#2962ff", annotation_text="Entry")
-        fig.add_hline(y=res["sl"], line_dash="dot", line_color="#ef5350", annotation_text="Stop Loss")
-        fig.add_hline(y=res["target"], line_dash="dot", line_color="#26a69a", annotation_text="Target")
 
     fig.update_layout(
-        title=f"{symbol} — {tf_minutes}min (SMC view)", xaxis_rangeslider_visible=False,
-        height=560, margin=dict(l=10, r=10, t=40, b=10), template="plotly_dark",
+        template="plotly_dark",
+        paper_bgcolor="#0b0f19",
+        plot_bgcolor="#111827",
+        height=540,
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
-    return fig
+    
+    st.plotly_chart(fig, use_container_width=True)
 
+    # -------------------------------------------------------------
+    # 3.4 SECONDARY SMC & CONFLUENCE BREAKDOWN (COLLAPSIBLE)
+    # -------------------------------------------------------------
+    with st.expander("🔬 Smart Money Concepts (SMC) & Indicator Confluence", expanded=False):
+        c_smc1, c_smc2 = st.columns(2)
+        with c_smc1:
+            st.markdown("#### Market Structure & Zones")
+            st.write(f"• **Trend:** `{res['smc'].trend}`")
+            st.write(f"• **Structure:** `{res['smc'].market_structure}`")
+            st.write(f"• **BOS / CHOCH:** `{res['smc'].bos_choch_event.get('details', 'None')}`")
+            st.write(f"• **Liquidity Sweep:** `{res['smc'].sweep_event.get('details', 'None')}`")
+            st.write(f"• **Dealing Range Zone:** `{res['smc'].dealing_range.get('zone', 'N/A')} ({res['smc'].dealing_range.get('pct', 0)}%)`")
+            st.write(f"• **PDH / PDL:** `₹{res['smc'].pdh:.2f} / ₹{res['smc'].pdl:.2f} ({res['smc'].pdh_pdl_status})`")
 
-# ============================================================================
-# SESSION STATE INIT
-# ============================================================================
-for key, default in [
-    ("active_trade", None), ("trade_log", []), ("monitoring", False),
-    ("selected_symbol", None), ("selected_key", None),
-]:
-    if key not in st.session_state:
-        st.session_state[key] = default
+        with c_smc2:
+            st.markdown("#### Technical Confluence Score")
+            st.write(f"• **BUY Score:** `{sig.buy_score:.1f}` | **SELL Score:** `{sig.sell_score:.1f}`")
+            st.write(f"• **RSI (14):** `{res['indicators'].rsi:.1f}`")
+            st.write(f"• **MACD Hist:** `{res['indicators'].macd_hist:+.2f}`")
+            st.write(f"• **ADX (14):** `{res['indicators'].adx:.1f} (+DI {res['indicators'].plus_di:.1f}, -DI {res['indicators'].minus_di:.1f})`")
+            st.write(f"• **Volume Surge Ratio:** `{res['indicators'].volume_ratio:.2f}x` ({'Surge' if sig.volume_surge else 'Normal'})")
+            st.write(f"• **ATR Volatility:** `₹{res['indicators'].atr:.2f}`")
 
+        st.markdown("#### Detected Confluences")
+        for c in sig.confluence_factors:
+            st.markdown(f"- {c}")
 
-# ============================================================================
-# SIDEBAR
-# ============================================================================
-st.sidebar.title("⚙️ Setup")
-access_token = st.sidebar.text_input("Upstox API v2 access token", type="password")
-tf_minutes = st.sidebar.selectbox("Timeframe", [1, 3, 5, 15], index=2, format_func=lambda x: f"{x} min")
-refresh_sec = st.sidebar.slider("Auto-refresh every (sec)", 15, 120, 30, step=5)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔎 Find a stock")
-query = st.sidebar.text_input("Stock name / symbol", placeholder="e.g. RELIANCE, TCS, HDFC BANK")
-
-instrument_key, symbol_label = None, None
-if access_token and query:
-    try:
-        inst_df = load_instruments()
-        matches = search_instrument(inst_df, query)
-        if len(matches):
-            options = {f"{r.tradingsymbol} — {r.name}": r.instrument_key for r in matches.itertuples()}
-            choice = st.sidebar.selectbox("Matches", list(options.keys()))
-            instrument_key = options[choice]
-            symbol_label = choice.split(" — ")[0]
-        else:
-            st.sidebar.warning("No matches found.")
-    except Exception as e:
-        st.sidebar.error(f"Could not load instrument list: {e}")
-elif not access_token:
-    st.sidebar.info("Paste your Upstox access token to search stocks.")
-
-st.sidebar.markdown("---")
-col_a, col_b = st.sidebar.columns(2)
-if col_a.button("▶ Start Monitoring", use_container_width=True, disabled=not instrument_key):
-    st.session_state.monitoring = True
-    st.session_state.selected_symbol = symbol_label
-    st.session_state.selected_key = instrument_key
-    st.session_state.active_trade = None
-if col_b.button("⏹ Stop", use_container_width=True):
-    st.session_state.monitoring = False
-
-st.sidebar.markdown("---")
-st.sidebar.caption(
-    "⚠️ This tool NEVER places, modifies or cancels orders. It only analyzes "
-    "completed candles and shows you Entry / Stop Loss / Target for manual execution."
-)
-
-if not HAS_AUTOREFRESH:
-    st.sidebar.caption("Tip: `pip install streamlit-autorefresh` for live auto-refresh during market hours.")
-
-
-# ============================================================================
-# MAIN AREA
-# ============================================================================
-st.title("📈 SMC Intraday Signal Assistant")
-st.caption("Break of Structure • Change of Character • Liquidity Sweeps • Order Blocks • FVG • Displacement")
-
-top1, top2, top3 = st.columns([2, 2, 3])
-top1.metric("Market", market_status_label())
-top2.metric("Now (IST)", now_ist().strftime("%H:%M:%S"))
-top3.metric("Selected", st.session_state.selected_symbol or "—")
-
-st.markdown(
-    "> **Disclaimer:** Educational decision-support only. SMC signals are rule-based approximations "
-    "of a discretionary methodology and can be wrong. No order is ever placed automatically — "
-    "you decide whether, when and how to execute."
-)
-
-if not st.session_state.monitoring or not st.session_state.selected_key:
-    st.info("Enter your access token, search a stock, and click **Start Monitoring** in the sidebar.")
-    st.stop()
-
-if HAS_AUTOREFRESH and is_market_open():
-    st_autorefresh(interval=refresh_sec * 1000, key="live_refresh")
-elif not is_market_open():
-    st.warning("Market is currently closed (NSE hours: 9:15 AM – 3:30 PM, Mon–Fri). Showing last available data.")
-    if st.button("🔄 Refresh now"):
-        st.rerun()
-else:
-    if st.button("🔄 Refresh now"):
-        st.rerun()
-
-# ---- Fetch + analyze ----
-df, err = get_completed_candles(st.session_state.selected_key, access_token, tf_minutes)
-
-if df.empty:
-    st.error(f"No candle data returned yet. {('Error: ' + err) if err else 'Try again in a moment, or check your access token.'}")
-    st.stop()
-
-res = generate_signal(df)
-
-# ---- Manage active trade lifecycle (ENTER / EXIT) ----
-last_row = df.iloc[-1]
-exit_note = None
-if st.session_state.active_trade is None:
-    if res["signal"] in ("BUY", "SELL"):
-        st.session_state.active_trade = dict(
-            direction=res["signal"], entry=res["entry"], sl=res["sl"], target=res["target"],
-            entry_time=str(last_row["timestamp"]),
-        )
-else:
-    trade = st.session_state.active_trade
-    if trade["direction"] == "BUY":
-        if last_row["low"] <= trade["sl"]:
-            exit_note = ("STOP LOSS HIT", trade["sl"])
-        elif last_row["high"] >= trade["target"]:
-            exit_note = ("TARGET HIT", trade["target"])
-    else:
-        if last_row["high"] >= trade["sl"]:
-            exit_note = ("STOP LOSS HIT", trade["sl"])
-        elif last_row["low"] <= trade["target"]:
-            exit_note = ("TARGET HIT", trade["target"])
-
-    if exit_note:
-        st.session_state.trade_log.append(
-            dict(
-                symbol=st.session_state.selected_symbol, direction=trade["direction"],
-                entry=trade["entry"], sl=trade["sl"], target=trade["target"],
-                result=exit_note[0], exit_price=exit_note[1],
-                entry_time=trade["entry_time"], exit_time=str(last_row["timestamp"]),
-            )
-        )
-        st.session_state.active_trade = None
-
-# ============================================================================
-# SIGNAL PANEL
-# ============================================================================
-st.subheader("🎯 Current Signal")
-
-if st.session_state.active_trade:
-    t = st.session_state.active_trade
-    badge = "🟢 IN TRADE — BUY" if t["direction"] == "BUY" else "🔴 IN TRADE — SELL"
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Status", badge)
-    c2.metric("Entry", f"{t['entry']:.2f}")
-    c3.metric("Stop Loss", f"{t['sl']:.2f}")
-    c4.metric("Target", f"{t['target']:.2f}")
-    live_pl = (last_row["close"] - t["entry"]) if t["direction"] == "BUY" else (t["entry"] - last_row["close"])
-    st.caption(f"Entered at {t['entry_time']} • Live unrealized: {live_pl:+.2f} pts (last close {last_row['close']:.2f})")
-    st.info("Position is OPEN. This app will alert you here the moment SL or Target is hit on a completed candle. Manage/exit manually via your broker.")
-elif exit_note:
-    st.success(f"✅ {exit_note[0]} at {exit_note[1]:.2f} — trade closed. See log below. Watching for the next setup...")
-else:
-    if res["signal"] in ("BUY", "SELL"):
-        color = "🟢 BUY" if res["signal"] == "BUY" else "🔴 SELL"
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Signal", color)
-        c2.metric("Entry", f"{res['entry']:.2f}")
-        c3.metric("Stop Loss", f"{res['sl']:.2f}")
-        c4.metric("Target", f"{res['target']:.2f}")
-        rr = abs(res["target"] - res["entry"]) / max(abs(res["entry"] - res["sl"]), 0.01)
-        st.caption(f"Risk:Reward ≈ 1:{rr:.2f}")
-        st.success(f"**ENTER now** — {res['reason']}")
-    else:
-        st.warning(f"⏳ **WAIT** — {res['reason']}")
-
-st.caption(f"Market structure trend (from swings): **{res['trend'] or 'undetermined'}**  •  Last completed candle: {last_row['timestamp']}")
-
-# ============================================================================
-# CHART
-# ============================================================================
-st.plotly_chart(build_chart(res, st.session_state.selected_symbol, tf_minutes), use_container_width=True)
-
-# ============================================================================
-# DETECTED EVENTS
-# ============================================================================
-with st.expander("🔍 Detected structure events (recent)"):
-    ev_df = pd.DataFrame(res["events"][-15:])
-    if len(ev_df):
-        st.dataframe(ev_df[["timestamp", "type", "direction", "price"]], use_container_width=True, hide_index=True)
-    else:
-        st.write("No BOS/CHoCH events yet.")
-
-with st.expander("💧 Liquidity sweeps (recent)"):
-    sw_df = pd.DataFrame(res["sweeps"][-10:])
-    if len(sw_df):
-        st.dataframe(sw_df[["timestamp", "type", "level", "direction"]], use_container_width=True, hide_index=True)
-    else:
-        st.write("No liquidity sweeps detected recently.")
-
-with st.expander("📦 Order Blocks & Fair Value Gaps (recent)"):
-    ob_df = pd.DataFrame(res["obs"][-10:])
-    fv_df = pd.DataFrame(res["fvgs"][-10:])
-    cc1, cc2 = st.columns(2)
-    with cc1:
-        st.markdown("**Order Blocks**")
-        st.dataframe(ob_df[["timestamp", "type", "top", "bottom"]] if len(ob_df) else pd.DataFrame(), use_container_width=True, hide_index=True)
-    with cc2:
-        st.markdown("**Fair Value Gaps**")
-        st.dataframe(fv_df[["timestamp", "type", "top", "bottom"]] if len(fv_df) else pd.DataFrame(), use_container_width=True, hide_index=True)
-
-# ============================================================================
-# TRADE LOG
-# ============================================================================
-st.subheader("📒 Signal / Trade Log")
-if st.session_state.trade_log:
-    st.dataframe(pd.DataFrame(st.session_state.trade_log), use_container_width=True, hide_index=True)
-else:
-    st.caption("No closed setups yet this session.")
+    # -------------------------------------------------------------
+    # 3.5 TELEGRAM NOTIFICATION ACTION
+    # -------------------------------------------------------------
+    if telegram_notifier.is_configured():
+        col_tg_left, col_tg_btn = st.columns([3, 1])
+        with col_tg_left:
+            st.caption("Telegram bot alerts configured.")
+        with col_tg_btn:
+            if st.button("✈️ Send Telegram Alert", use_container_width=True):
+                sent = telegram_notifier.send_signal_alert(
+                    symbol=sym,
+                    direction=sig.direction,
+                    current_price=current_p,
+                    entry=sig.entry_price,
+                    target=tgt.target_price,
+                    stop_loss=rsk.stop_loss,
+                    rr_ratio=rsk.risk_reward_ratio,
+                    force=True
+                )
+                if sent:
+                    st.toast("✅ Telegram alert sent successfully!")
+                else:
+                    st.error("Failed to send Telegram alert.")
