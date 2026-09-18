@@ -5,3 +5,4 @@ requests
 plotly
 streamlit-autorefresh
 python-dotenv
+pytz
