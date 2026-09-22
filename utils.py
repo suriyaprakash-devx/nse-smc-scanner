@@ -3,6 +3,10 @@ from typing import Optional, Tuple
 import pytz
 from config import settings
 
+class MarketDataUnavailableError(Exception):
+    """Raised when market data is missing, corrupted, stale, or synthetic in live mode."""
+    pass
+
 def get_ist_timezone() -> pytz.BaseTzInfo:
     return pytz.timezone(settings.TIMEZONE)
 
@@ -21,23 +25,16 @@ def format_ist_time(dt: Optional[datetime] = None, include_date: bool = False) -
         return dt.strftime("%Y-%m-%d %H:%M:%S IST")
     return dt.strftime("%H:%M:%S IST")
 
+from calendar_utils import (
+    get_market_session_status,
+    is_nse_holiday,
+    is_nse_trading_day,
+    get_previous_trading_day
+)
+
 def is_nse_market_open() -> Tuple[bool, str]:
-    """Returns True/False and human-readable status string for NSE regular market hours (09:15 - 15:30 IST)."""
-    now = get_ist_now()
-    weekday = now.weekday()  # 0 = Monday, 6 = Sunday
-    
-    if weekday >= 5:
-        return False, "🔴 Market Closed (Weekend)"
-        
-    open_time = now.replace(hour=settings.MARKET_OPEN_HOUR, minute=settings.MARKET_OPEN_MINUTE, second=0, microsecond=0)
-    close_time = now.replace(hour=settings.MARKET_CLOSE_HOUR, minute=settings.MARKET_CLOSE_MINUTE, second=0, microsecond=0)
-    
-    if open_time <= now <= close_time:
-        return True, "🟢 Market Open"
-    elif now < open_time:
-        return False, "🔴 Market Closed (Pre-Market)"
-    else:
-        return False, "🔴 Market Closed (Post-Market)"
+    """Returns True/False and human-readable status string for NSE market hours, weekends, and holidays."""
+    return get_market_session_status()
 
 def mask_token(token: Optional[str]) -> str:
     """Masks Upstox access token for display. Never reveals the full secret."""

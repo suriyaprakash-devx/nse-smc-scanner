@@ -9,57 +9,56 @@ The application is built around one singular, uncompromising goal:
 
 ## ⚡ Key Highlights
 
-* **Strict Binary Decision**: **NEVER** displays `WAIT`, `WATCH`, `NO TRADE`, `HOLD`, or `NEUTRAL`. Outputs strictly **🟢 BUY** or **🔴 SELL**.
-* **Zero Instrument Key Hassle**: Automatically resolves official NSE instrument keys from the 1,100+ equity Upstox universe (e.g., `SAIL` ➔ `NSE_EQ|INE114A01011`).
-* **5 Primary Outputs (Zero Distraction)**:
-  1. **Current Price**: ₹XXX.XX (live Upstox tick data)
-  2. **🟢 BUY** or **🔴 SELL**
-  3. **Entry Price**: ₹XXX.XX (calculated valid entry / retest / breakout level)
-  4. **Estimated Maximum Target**: ₹XXX.XX (structural upside/downside projection, with move %)
-  5. **Stop Loss**: ₹XXX.XX (structural invalidation level, with risk %)
-* **Risk / Reward**: Dynamically calculated (e.g., `1 : 2.5`).
-* **Closed-Candle Analysis**: Eliminates look-ahead bias and repainting.
-* **Token Security**: Tokens are held exclusively in Streamlit session state and are **never** logged, printed to console, or exposed.
-* **Interactive Candlestick Chart**: Plotly chart with multi-timeframe support (`1m`, `3m`, `5m`, `15m`, `30m`, `1h`), EMAs (9, 21, 50), VWAP, Previous Day High/Low, and Volume sub-panel.
-* **Optional Collapsible SMC Panel**: Deep-dive into Market Structure, BOS/CHOCH, Order Blocks, Liquidity Sweeps, FVGs, and Indicator scores without cluttering the main view.
-* **Telegram Integration**: Instant alerts delivered to Telegram with duplicate suppression.
+* **All 3,370+ NSE Stocks Supported**: Complete catalog of all active NSE equities with company names, ISINs, and alias lookups (`TATAMOTORS`/`TMCV`, `ZOMATO`/`ETERNAL`).
+* **Official NSE Watchlist Presets**: Instant one-click scanning of **NIFTY 50 (All 50 Stocks)**, **NIFTY NEXT 50**, **NIFTY 100**, **NSE F&O UNIVERSE (All 199 Derivative Stocks)**, **NIFTY BANK**, **NIFTY IT**, **NIFTY AUTO**, **NIFTY METAL**, **NIFTY PHARMA**, **NIFTY FMCG**, **NIFTY ENERGY**, **NIFTY PSU BANK**, **NIFTY REALTY**, and **HIGH MOMENTUM**.
+* **Blazing Fast Multi-Stock Scanner**: Multi-threaded parallel scanning via `ThreadPoolExecutor` analyzing 50–200 stocks in seconds with live progress tracking.
+* **Interactive Table & CSV Export**: Real-time filtering by Signal (BUY/SELL), Volume Surge ($\ge 1.5\times$), Market Structure (BOS/CHOCH), sorting, and 1-click CSV download.
+* **Searchable Autocomplete in Deep-Dive**: Smart searchable dropdown containing all 3,370+ NSE companies with instant interactive Plotly charting.
+* **Decisive Directional Output**: Strictly outputs **🟢 BUY** or **🔴 SELL** with complete structural trade management.
+* **Accurate Previous Day High/Low (PDH / PDL)**: High and Low of the previous **completed** NSE trading session, accurately handling weekends, market closures, and official NSE holidays. Never uses today's in-progress OHLC.
+* **Zero Fake Data in LIVE Mode**: If live Upstox API requests fail, the system reports `DATA ERROR` and **never** generates signals from synthetic data.
+* **Core Semi-Algo Strategy**:
+  - **EMA 6 & EMA 30**: Ultra-agile intraday momentum and trend alignment.
+  - **Session-Reset VWAP**: Resets strictly at 09:15 at the start of every NSE trading session.
+  - **Volume 20-MA & 1.5x Ratio**: Real participation filter displaying current volume, average volume, and volume ratio.
+  - **Wilder's Smoothing**: Standard Wilder's smoothing for RSI (14), ATR (14), and ADX (14).
+* **Proper 5m and 10m Timeframe Support**: 10-minute candles are strictly constructed with exact NSE 09:15 session alignment (`09:15–09:24`, `09:25–09:34`, etc.). Only completed candles are analyzed.
+* **Enhanced Smart Money Concepts (SMC)**:
+  - Confirmed non-repainting swings (HH, HL, LH, LL) and protected structural pivots.
+  - Break of Structure (BOS) vs Change of Character (CHOCH).
+  - Liquidity sweeps: SSL (Bullish), BSL (Bearish), PDH and PDL sweeps.
+  - Fresh vs Mitigated Order Blocks and Fair Value Gaps (FVG).
+  - Dealing range with 50% equilibrium and Premium/Discount zones.
+* **Multi-Target & Structural Risk Engine**:
+  - **TP1**: Nearest meaningful structural level / liquidity pool.
+  - **TP2**: Major structural target (prioritizes PDH/PDL, major swings).
+  - **TP3**: Extended structural / runner target.
+  - **Structural Stop Loss**: Anchored below swing low/OB/sweep for BUY, above swing high/OB/sweep for SELL, with ATR buffer.
+  - **Enforced Minimum R:R**: 1 : 2.0+.
+* **Token Security & Persistent Alerts**: Upstox access tokens are masked and never logged. Telegram duplicate alert prevention is persistent across app restarts via `.sent_alerts.json`.
 
 ---
 
 ## 🧠 Confluence Decision Engine
 
-Signals are generated using a multi-factor directional scoring model:
+Signals are grouped into 4 transparent categories:
 
-1. **Technical Indicators**:
-   - EMA Alignment: EMA 9, EMA 21, EMA 50
-   - RSI (14) momentum and crossing
-   - MACD (12, 26, 9) histogram expansion
-   - Intraday VWAP relative positioning
-   - ADX (14) trend strength with +DI / -DI
-   - Bollinger Bands (20, 2 std)
-   - Volume surge filter (>= 1.5x 20-period Volume MA)
-2. **Price Action**:
-   - Candle structure & body size
-   - Bullish & Bearish Engulfing
-   - Range Breakout / Breakdown (20 bars)
-   - Wick rejection analysis
-3. **Smart Money Concepts (SMC)**:
-   - Non-repainting Fractal Swing Highs and Swing Lows
-   - Structural points: Higher Highs (HH), Higher Lows (HL), Lower Highs (LH), Lower Lows (LL)
-   - Break of Structure (BOS) and Change of Character (CHOCH)
-   - Liquidity Sweeps: Buy-Side Liquidity (BSL) and Sell-Side Liquidity (SSL)
-   - Fair Value Gaps (FVG) with mitigation tracking
-   - Bullish & Bearish Order Blocks
-   - Dealing Range: Premium vs Discount zone equilibrium
-4. **Previous Day Levels**:
-   - Previous Day High (PDH) & Previous Day Low (PDL)
-
-```python
-if BUY_SCORE >= SELL_SCORE:
-    DECISION = "BUY"
-else:
-    DECISION = "SELL"
-```
+1. **Structure (SMC)**:
+   - Market structure sequence (HH/HL or LH/LL)
+   - Bullish / Bearish BOS & CHOCH confirmation
+   - Liquidity sweeps (SSL, BSL, PDH, PDL)
+   - Fresh unmitigated Order Blocks & FVGs
+   - Premium / Discount dealing range location
+2. **Trend**:
+   - EMA 6 vs EMA 30 crossover and alignment
+   - Session-reset VWAP relationship (above VWAP for long, below for short)
+3. **Participation**:
+   - Volume 20-period moving average
+   - Volume ratio (>= 1.5x volume surge detection)
+4. **Risk & Execution**:
+   - Structural invalidation stop loss
+   - Multi-target planning (TP1, TP2, TP3) calibrated for at least 1:2.0 Risk/Reward
+   - Suggested entry zone and confirmation price
 
 ---
 

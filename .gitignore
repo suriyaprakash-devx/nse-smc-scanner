@@ -23,6 +23,8 @@ htmlcov/
 .env
 *.pem
 *.key
+.sent_alerts.json
+scratch/
 
 # IDE
 .vscode/
@@ -36,3 +38,6 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Nested duplicate folder from zip extraction
+nse-smc-scanner-main/

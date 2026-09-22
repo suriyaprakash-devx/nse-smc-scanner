@@ -23,10 +23,12 @@ class Settings:
     
     # Analysis & Engine Settings
     DEFAULT_TIMEFRAME: str = "5m"
-    ALLOWED_TIMEFRAMES: tuple = ("1m", "3m", "5m", "15m", "30m", "1h")
+    ALLOWED_TIMEFRAMES: tuple = ("5m", "10m", "1m", "3m", "15m", "30m", "1h")
     DEFAULT_VOLUME_MULTIPLIER: float = float(os.getenv("VOLUME_MULTIPLIER", "1.5"))
+    EMA_FAST: int = 6
+    EMA_SLOW: int = 30
     SWING_WINDOW: int = int(os.getenv("SWING_WINDOW", "3"))
-    MIN_RR_RATIO: float = float(os.getenv("MIN_RR_RATIO", "1.5"))
+    MIN_RR_RATIO: float = float(os.getenv("MIN_RR_RATIO", "2.0"))
     EQ_TOLERANCE_PCT: float = 0.0015  # 0.15% for Equal Highs / Equal Lows
     
     # Telegram Integration (Optional)
