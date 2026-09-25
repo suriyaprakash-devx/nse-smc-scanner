@@ -30,9 +30,6 @@ class Settings:
     SWING_WINDOW: int = int(os.getenv("SWING_WINDOW", "3"))
     MIN_RR_RATIO: float = float(os.getenv("MIN_RR_RATIO", "2.0"))
     EQ_TOLERANCE_PCT: float = 0.0015  # 0.15% for Equal Highs / Equal Lows
-    
-    # Telegram Integration (Optional)
-    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
 
 settings = Settings()
